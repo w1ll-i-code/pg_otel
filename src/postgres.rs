@@ -1,5 +1,6 @@
 use std::{
     ffi::CStr,
+    sync::atomic::Ordering,
     time::{Duration, SystemTime},
 };
 
@@ -9,7 +10,7 @@ use pgrx::pg_sys::{
     Oid,
 };
 
-use crate::{span::HeaplessSpan, DEQUE};
+use crate::{span::HeaplessSpan, DEQUE, WORKER_PID};
 
 pub fn request_instrumentation(query_desc: *mut pg_sys::QueryDesc) {
     if query_desc.is_null() {
@@ -40,6 +41,7 @@ pub fn collect_spans(query_desc: *mut pg_sys::QueryDesc) {
 
     let planstate = unsafe { (*query_desc).planstate };
     collect_plan_spans(planstate, wall_start);
+    pg_otel_wake_worker();
 }
 
 pub fn collect_plan_spans(planstate: *mut pg_sys::PlanState, wall_start: SystemTime) {
@@ -142,4 +144,14 @@ pub fn pg_str<'a>(s: *const i8) -> Option<&'a str> {
     // Check utf-8 validity
     let cstr = unsafe { CStr::from_ptr(s) };
     cstr.to_str().ok()
+}
+
+/// Wake the worker after work has been added to the shared queue.
+pub fn pg_otel_wake_worker() -> bool {
+    let pid = WORKER_PID.get().load(Ordering::Relaxed);
+    if pid == 0 {
+        return false;
+    }
+
+    unsafe { libc::kill(pid, libc::SIGINT) == 0 }
 }

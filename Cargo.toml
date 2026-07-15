@@ -20,9 +20,11 @@ pg_bench = ["dep:pgrx-bench"]
 
 [dependencies]
 heapless = "0.9.3"
+libc = "0.2"
 opentelemetry = { version = "0.32.0", default-features = false, features = ["tracing"] }
 opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["trace"] }
 pgrx = "=0.19.1"
+tokio = { version = "1.52.3", features = ["rt"] }
 
 [dependencies.pgrx-bench]
 version = "=0.19.1"

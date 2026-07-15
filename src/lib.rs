@@ -1,8 +1,10 @@
+use std::sync::atomic::{AtomicI32, Ordering};
+
 use pgrx::{
     bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags},
     pg_shmem_init,
     prelude::*,
-    AssertPGRXSharedMemory, PgLwLock,
+    AssertPGRXSharedMemory, PgAtomic, PgLwLock,
 };
 
 use crate::{
@@ -27,6 +29,10 @@ mod worker;
 static DEQUE: PgLwLock<AssertPGRXSharedMemory<heapless::spsc::Queue<HeaplessSpan, 1024>>> =
     unsafe { PgLwLock::new(c"pg_otel_worker_deque") };
 
+// The PID is published by the worker after it starts. A zero value means that
+// the worker has not started (or has already exited).
+static WORKER_PID: PgAtomic<AtomicI32> = unsafe { PgAtomic::new(c"pg_otel_worker_pid") };
+
 #[test]
 fn test() {
     dbg!(std::mem::size_of::<HeaplessSpan>());
@@ -47,6 +53,7 @@ pub extern "C-unwind" fn _PG_init() {
     }
 
     pg_shmem_init!(DEQUE = unsafe { AssertPGRXSharedMemory::new(Default::default()) });
+    pg_shmem_init!(WORKER_PID);
 
     BackgroundWorkerBuilder::new("Background Worker Example")
         .set_function("background_worker_main")
@@ -67,11 +74,21 @@ pub extern "C-unwind" fn _PG_init() {
 #[pg_guard]
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn background_worker_main(_arg: pg_sys::Datum) {
+    // Publish the PID from inside the worker process. MyProcPid is the PID that
+    // another backend must signal to wake this worker.
+    WORKER_PID
+        .get()
+        .swap(unsafe { pg_sys::MyProcPid }, Ordering::Relaxed);
+
     // these are the signals we want to receive.  If we don't attach the SIGTERM handler, then
     // we'll never be able to exit via an external notification
-    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
+    BackgroundWorker::attach_signal_handlers(
+        SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM | SignalWakeFlags::SIGINT,
+    );
 
     background_worker_run();
+
+    WORKER_PID.get().store(0, Ordering::Relaxed);
 
     log!(
         "Goodbye from inside the {} BGWorker! ",
