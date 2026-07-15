@@ -35,28 +35,34 @@ pub fn collect_spans(query_desc: *mut pg_sys::QueryDesc) {
     let total = unsafe { (*(*query_desc).query_instr).total.ticks };
     let wall_start = end_time - Duration::from_nanos(total as u64);
 
-    if let Some(span) = HeaplessSpan::from_query(query_desc, wall_start) {
-        let _ = DEQUE.exclusive().enqueue(span);
-    }
+    let Some(span) = HeaplessSpan::from_query(query_desc, wall_start) else {
+        return;
+    };
 
     let planstate = unsafe { (*query_desc).planstate };
-    collect_plan_spans(planstate, wall_start);
+    collect_plan_spans(planstate, wall_start, &span);
+    let _ = DEQUE.exclusive().enqueue(span);
     pg_otel_wake_worker();
 }
 
-pub fn collect_plan_spans(planstate: *mut pg_sys::PlanState, wall_start: SystemTime) {
-    if let Some(span) = HeaplessSpan::from_plan(planstate, wall_start) {
-        let _ = DEQUE.exclusive().enqueue(span);
-    }
+pub fn collect_plan_spans(
+    planstate: *mut pg_sys::PlanState,
+    wall_start: SystemTime,
+    parent: &HeaplessSpan,
+) {
+    let Some(span) = HeaplessSpan::from_plan(planstate, wall_start, parent) else {
+        return;
+    };
 
     let lefttree = unsafe { (*planstate).lefttree };
     let righttree = unsafe { (*planstate).righttree };
     if !lefttree.is_null() {
-        collect_plan_spans(lefttree, wall_start);
+        collect_plan_spans(lefttree, wall_start, &span);
     }
     if !righttree.is_null() {
-        collect_plan_spans(righttree, wall_start);
+        collect_plan_spans(righttree, wall_start, &span);
     }
+    let _ = DEQUE.exclusive().enqueue(span);
 }
 
 pub fn collect_table_names(state: *const pg_sys::PlanState) -> Vec<String> {

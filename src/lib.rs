@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 use pgrx::{
     bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags},
+    guc::{GucContext, GucFlags, GucRegistry, GucSetting},
     pg_shmem_init,
     prelude::*,
     AssertPGRXSharedMemory, PgAtomic, PgLwLock,
@@ -33,6 +34,19 @@ static DEQUE: PgLwLock<AssertPGRXSharedMemory<heapless::spsc::Queue<HeaplessSpan
 // the worker has not started (or has already exited).
 static WORKER_PID: PgAtomic<AtomicI32> = unsafe { PgAtomic::new(c"pg_otel_worker_pid") };
 
+pub static OTLP_ENDPOINT: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"http://localhost:4317"));
+pub static OTLP_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(10_000);
+pub static OTLP_PROTOCOL: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"grpc"));
+pub static OTLP_AUTHORIZATION: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(None);
+pub static OTLP_CA_CERTIFICATE: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(None);
+
+pub static OTLP_SERVICE_NAME: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"postgres"));
+
 #[test]
 fn test() {
     dbg!(std::mem::size_of::<HeaplessSpan>());
@@ -51,6 +65,49 @@ pub extern "C-unwind" fn _PG_init() {
     if unsafe { !pgrx::pg_sys::process_shared_preload_libraries_in_progress } {
         pgrx::error!("this extension must be loaded via shared_preload_libraries.");
     }
+
+    GucRegistry::define_string_guc(
+        c"pg_otel.otlp_endpoint",
+        c"OTLP exporter endpoint",
+        c"The endpoint used by the OTLP exporter.",
+        &OTLP_ENDPOINT,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"pg_otel.otlp_protocol",
+        c"OTLP exporter protocol",
+        c"The OTLP protocol: grpc or http/protobuf.",
+        &OTLP_PROTOCOL,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"pg_otel.otlp_authorization",
+        c"OTLP authorization header",
+        c"The value of the Authorization header sent to the OTLP collector.",
+        &OTLP_AUTHORIZATION,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"pg_otel.otlp_ca_certificate",
+        c"OTLP CA certificate path",
+        c"Path to a PEM-encoded CA certificate used to verify the OTLP collector.",
+        &OTLP_CA_CERTIFICATE,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"pg_otel.otlp_timeout_ms",
+        c"OTLP exporter timeout in milliseconds",
+        c"The timeout used by the OTLP exporter.",
+        &OTLP_TIMEOUT_MS,
+        1,
+        86_400_000,
+        GucContext::Sighup,
+        GucFlags::default(),
+    );
 
     pg_shmem_init!(DEQUE = unsafe { AssertPGRXSharedMemory::new(Default::default()) });
     pg_shmem_init!(WORKER_PID);

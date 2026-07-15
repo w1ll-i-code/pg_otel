@@ -22,9 +22,12 @@ pg_bench = ["dep:pgrx-bench"]
 heapless = "0.9.3"
 libc = "0.2"
 opentelemetry = { version = "0.32.0", default-features = false, features = ["tracing"] }
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["trace", "http-proto", "grpc-tonic", "tls-ring"] }
 opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["trace"] }
+tonic = { version = "0.14.6", features = ["tls-ring"] }
 pgrx = "=0.19.1"
 tokio = { version = "1.52.3", features = ["rt"] }
+fastrand = "2.4.1"
 
 [dependencies.pgrx-bench]
 version = "=0.19.1"

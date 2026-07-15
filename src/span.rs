@@ -12,7 +12,10 @@ use pgrx::{
     pg_sys::{CmdType, NodeTag, PlanState, QueryDesc},
 };
 
-use crate::postgres::{collect_table_names, pg_str};
+use crate::{
+    postgres::{collect_table_names, pg_str},
+    OTLP_SERVICE_NAME,
+};
 
 const QUERY_TEXT_MAX_LEN: usize = 512;
 const PLAN_NODE_NAME_MAX_LEN: usize = 64;
@@ -84,8 +87,8 @@ impl HeaplessSpan {
         let exec_total_time_seconds = instrument.total.ticks as f64 / 1e9;
 
         Some(HeaplessSpan {
-            trace_id: TraceId::INVALID,
-            span_id: SpanId::INVALID,
+            trace_id: TraceId::from(fastrand::u128(..)),
+            span_id: SpanId::from(fastrand::u64(..)),
             parent_id: SpanId::INVALID,
             name,
             start_time,
@@ -99,7 +102,11 @@ impl HeaplessSpan {
         })
     }
 
-    pub fn from_plan(plan_node: *const PlanState, wall_start: SystemTime) -> Option<Self> {
+    pub fn from_plan(
+        plan_node: *const PlanState,
+        wall_start: SystemTime,
+        parent: &HeaplessSpan,
+    ) -> Option<Self> {
         let Some(plan_node) = (unsafe { plan_node.as_ref() }) else {
             return None;
         };
@@ -133,9 +140,9 @@ impl HeaplessSpan {
         }
 
         Some(HeaplessSpan {
-            trace_id: TraceId::INVALID,
-            span_id: SpanId::INVALID,
-            parent_id: SpanId::INVALID,
+            trace_id: parent.trace_id,
+            span_id: SpanId::from(fastrand::u64(..)),
+            parent_id: parent.span_id,
             name,
             start_time,
             end_time,
@@ -188,6 +195,11 @@ impl From<HeaplessSpan> for SpanData {
             .with_version("19")
             .build();
 
+        let service_name = OTLP_SERVICE_NAME
+            .get()
+            .and_then(|s| s.into_string().ok())
+            .unwrap_or_else(|| "postgres".to_owned());
+
         match span.attributes {
             HeaplessSpanAttributes::Query(attr) => {
                 let operation = query_name(attr.operation);
@@ -213,6 +225,7 @@ impl From<HeaplessSpan> for SpanData {
                             "postgresql.execution.total_time_seconds",
                             attr.exec_total_time_seconds,
                         ),
+                        KeyValue::new("service.name", service_name),
                     ],
                     dropped_attributes_count: 0,
                     events: Default::default(),
@@ -274,6 +287,7 @@ impl From<HeaplessSpan> for SpanData {
                             "postgresql.instrumentation.rows_removed_by_other_filter",
                             attr.instr_rows_removed_by_other_filter,
                         ),
+                        KeyValue::new("service.name", service_name),
                     ],
                     dropped_attributes_count: 0,
                     events: Default::default(),
