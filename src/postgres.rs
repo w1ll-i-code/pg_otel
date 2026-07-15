@@ -57,7 +57,7 @@ pub fn collect_plan_spans(planstate: *mut pg_sys::PlanState, wall_start: SystemT
     }
 }
 
-pub fn collect_table_names(state: *const pg_sys::PlanState) -> Vec<Oid> {
+pub fn collect_table_names(state: *const pg_sys::PlanState) -> Vec<String> {
     if state.is_null() {
         return Vec::new();
     }
@@ -80,13 +80,13 @@ pub fn collect_table_names(state: *const pg_sys::PlanState) -> Vec<Oid> {
     tables
 }
 
-fn push_unique(values: &mut Vec<Oid>, value: Oid) {
+fn push_unique(values: &mut Vec<String>, value: String) {
     if !values.iter().any(|existing| existing == &value) {
         values.push(value);
     }
 }
 
-fn relation_name(state: *const pg_sys::PlanState) -> Option<Oid> {
+fn relation_name(state: *const pg_sys::PlanState) -> Option<String> {
     let plan = unsafe { (*state).plan };
     if plan.is_null() {
         return None;
@@ -124,7 +124,18 @@ fn relation_name(state: *const pg_sys::PlanState) -> Option<Oid> {
         return None;
     }
 
-    Some(unsafe { (*relation).rd_id })
+    plan_table_identifier(unsafe { (*relation).rd_id })
+}
+
+pub fn plan_table_identifier(oid: Oid) -> Option<String> {
+    let namespace_oid = unsafe { pg_sys::get_rel_namespace(oid) };
+    let relation_name = unsafe { pg_str(pg_sys::get_rel_name(oid)) }?;
+    let namespace_name = unsafe { pg_str(pg_sys::get_namespace_name_or_temp(namespace_oid)) };
+
+    Some(match namespace_name {
+        Some(namespace_name) => format!("{}.{}", namespace_name, relation_name),
+        None => relation_name.to_owned(),
+    })
 }
 
 pub fn pg_str<'a>(s: *const i8) -> Option<&'a str> {
