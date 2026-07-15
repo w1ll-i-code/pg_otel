@@ -33,6 +33,9 @@ pub fn collect_spans(query_desc: *mut pg_sys::QueryDesc) {
     // This should be close enough to the actual end time.
     let end_time = SystemTime::now();
     let total = unsafe { (*(*query_desc).query_instr).total.ticks };
+    if !meets_slow_query_threshold(total) {
+        return;
+    }
     let wall_start = end_time - Duration::from_nanos(total as u64);
 
     let Some(span) = HeaplessSpan::from_query(query_desc, wall_start) else {
@@ -43,6 +46,11 @@ pub fn collect_spans(query_desc: *mut pg_sys::QueryDesc) {
     collect_plan_spans(planstate, wall_start, &span);
     let _ = DEQUE.exclusive().enqueue(span);
     pg_otel_wake_worker();
+}
+
+fn meets_slow_query_threshold(duration_ns: i64) -> bool {
+    let threshold_ms = unsafe { pg_sys::log_min_duration_statement };
+    threshold_ms >= 0 && duration_ns >= i64::from(threshold_ms) * 1_000_000
 }
 
 pub fn collect_plan_spans(
