@@ -12,7 +12,7 @@ use pgrx::{
     pg_sys::{CmdType, NodeTag, PlanState, QueryDesc},
 };
 
-use crate::postgres::{collect_table_names, pg_str};
+use crate::postgres::{collect_table_names, pg_str, plan_table_name};
 
 const QUERY_TEXT_MAX_LEN: usize = 512;
 const PLAN_NODE_NAME_MAX_LEN: usize = 64;
@@ -116,14 +116,17 @@ impl HeaplessSpan {
             return None;
         };
 
-        let name = format!("postgres.operation.{:?}", plan_node.type_);
-        let name = heapless::String::try_from(name.as_str()).expect("name is bounded");
-
         let start_time = wall_start + Duration::from_nanos(instrument.instr.starttime.ticks as u64);
         let end_time = wall_start + Duration::from_nanos(instrument.instr.total.ticks as u64);
 
         let plan_table_names = collect_table_names(plan_node);
         let plan_table_len = plan_table_names.len();
+        let table_suffix = plan_table_name(plan_node)
+            .map(|table| format!(" [{}]", table))
+            .unwrap_or_default();
+        let name = format!("postgres.operation.{:?}{}", plan_node.type_, table_suffix);
+        let name_end = name.floor_char_boundary(PLAN_NODE_NAME_MAX_LEN);
+        let name = heapless::String::try_from(&name[..name_end]).expect("name was truncated");
 
         let mut plan_tables = heapless::Vec::new();
         for table_name in plan_table_names {

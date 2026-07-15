@@ -59,17 +59,15 @@ impl ExporterConfig {
             .and_then(|value| value.into_string().ok())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "postgres".to_owned());
-        let config = Self {
+
+        Ok(Self {
             endpoint,
             protocol,
             timeout_ms: OTLP_TIMEOUT_MS.get() as u32,
             authorization,
             ca_certificate,
             service_name,
-        };
-        log!("OTLP CA certificate path: {:?}", config);
-
-        Ok(config)
+        })
     }
 }
 
@@ -176,6 +174,8 @@ async fn build_exporter() -> Option<SpanExporter> {
                 .with_attributes([
                     opentelemetry::KeyValue::new("telemetry.sdk.name", "opentelemetry"),
                     opentelemetry::KeyValue::new("telemetry.sdk.language", "rust"),
+                    opentelemetry::KeyValue::new("service.framework.name", "postgres"),
+                    opentelemetry::KeyValue::new("service.framework.version", "19"),
                     opentelemetry::KeyValue::new(
                         "telemetry.sdk.version",
                         env!("CARGO_PKG_VERSION"),

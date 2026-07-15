@@ -81,7 +81,7 @@ pub fn collect_table_names(state: *const pg_sys::PlanState) -> Vec<String> {
         push_unique(&mut tables, table);
     }
 
-    if let Some(table) = relation_name(state) {
+    if let Some(table) = plan_table_name(state) {
         push_unique(&mut tables, table);
     }
 
@@ -94,7 +94,7 @@ fn push_unique(values: &mut Vec<String>, value: String) {
     }
 }
 
-fn relation_name(state: *const pg_sys::PlanState) -> Option<String> {
+pub fn plan_table_name(state: *const pg_sys::PlanState) -> Option<String> {
     let plan = unsafe { (*state).plan };
     if plan.is_null() {
         return None;
