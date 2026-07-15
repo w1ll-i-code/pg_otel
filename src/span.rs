@@ -12,10 +12,7 @@ use pgrx::{
     pg_sys::{CmdType, NodeTag, PlanState, QueryDesc},
 };
 
-use crate::{
-    postgres::{collect_table_names, pg_str},
-    OTLP_SERVICE_NAME,
-};
+use crate::postgres::{collect_table_names, pg_str};
 
 const QUERY_TEXT_MAX_LEN: usize = 512;
 const PLAN_NODE_NAME_MAX_LEN: usize = 64;
@@ -191,14 +188,9 @@ impl From<HeaplessSpan> for SpanData {
             TraceState::default(),
         );
 
-        let instrumentation_scope = InstrumentationScope::builder("postgres")
-            .with_version("19")
+        let instrumentation_scope = InstrumentationScope::builder("pg_otel")
+            .with_version(env!("CARGO_PKG_VERSION"))
             .build();
-
-        let service_name = OTLP_SERVICE_NAME
-            .get()
-            .and_then(|s| s.into_string().ok())
-            .unwrap_or_else(|| "postgres".to_owned());
 
         match span.attributes {
             HeaplessSpanAttributes::Query(attr) => {
@@ -225,7 +217,6 @@ impl From<HeaplessSpan> for SpanData {
                             "postgresql.execution.total_time_seconds",
                             attr.exec_total_time_seconds,
                         ),
-                        KeyValue::new("service.name", service_name),
                     ],
                     dropped_attributes_count: 0,
                     events: Default::default(),
@@ -287,7 +278,6 @@ impl From<HeaplessSpan> for SpanData {
                             "postgresql.instrumentation.rows_removed_by_other_filter",
                             attr.instr_rows_removed_by_other_filter,
                         ),
-                        KeyValue::new("service.name", service_name),
                     ],
                     dropped_attributes_count: 0,
                     events: Default::default(),

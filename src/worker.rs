@@ -1,7 +1,10 @@
 use std::{collections::HashMap, fs, time::Duration};
 
 use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithHttpConfig, WithTonicConfig};
-use opentelemetry_sdk::trace::{SpanData, SpanExporter as _};
+use opentelemetry_sdk::{
+    trace::{SpanData, SpanExporter as _},
+    Resource,
+};
 use pgrx::{bgworkers::BackgroundWorker, log};
 use tonic::{
     metadata::MetadataMap,
@@ -10,7 +13,7 @@ use tonic::{
 
 use crate::{
     span::HeaplessSpan, DEQUE, OTLP_AUTHORIZATION, OTLP_CA_CERTIFICATE, OTLP_ENDPOINT,
-    OTLP_PROTOCOL, OTLP_TIMEOUT_MS,
+    OTLP_PROTOCOL, OTLP_SERVICE_NAME, OTLP_TIMEOUT_MS,
 };
 
 #[derive(Clone, Debug)]
@@ -20,6 +23,7 @@ pub struct ExporterConfig {
     pub timeout_ms: u32,
     pub authorization: Option<String>,
     pub ca_certificate: Option<String>,
+    pub service_name: String,
 }
 
 impl ExporterConfig {
@@ -50,12 +54,18 @@ impl ExporterConfig {
                     .map_err(|_| "OTLP CA certificate path is not valid UTF-8".to_owned())
             })
             .transpose()?;
+        let service_name = OTLP_SERVICE_NAME
+            .get()
+            .and_then(|value| value.into_string().ok())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "postgres".to_owned());
         let config = Self {
             endpoint,
             protocol,
             timeout_ms: OTLP_TIMEOUT_MS.get() as u32,
             authorization,
             ca_certificate,
+            service_name,
         };
         log!("OTLP CA certificate path: {:?}", config);
 
@@ -160,7 +170,21 @@ async fn build_exporter() -> Option<SpanExporter> {
     };
 
     match result {
-        Ok(exporter) => Some(exporter),
+        Ok(mut exporter) => {
+            let resource = Resource::builder()
+                .with_service_name(config.service_name)
+                .with_attributes([
+                    opentelemetry::KeyValue::new("telemetry.sdk.name", "opentelemetry"),
+                    opentelemetry::KeyValue::new("telemetry.sdk.language", "rust"),
+                    opentelemetry::KeyValue::new(
+                        "telemetry.sdk.version",
+                        env!("CARGO_PKG_VERSION"),
+                    ),
+                ])
+                .build();
+            exporter.set_resource(&resource);
+            Some(exporter)
+        }
         Err(error) => {
             log!("Could not build OTLP exporter: {}", error);
             None
