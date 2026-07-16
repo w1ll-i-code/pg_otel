@@ -4,13 +4,21 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use opentelemetry::{
+    Context,
+    trace::{SpanContext, TraceContextExt as _},
+};
 use pgrx::pg_sys::{
     self,
     InstrumentOption::{INSTRUMENT_ROWS, INSTRUMENT_TIMER},
     Oid,
 };
 
-use crate::{span::HeaplessSpan, DEQUE, WORKER_PID};
+use crate::{
+    DEQUE, WORKER_PID,
+    config::get_otlp_traceparent,
+    span::{HeaplessSpan, parse_traceparent},
+};
 
 pub fn request_instrumentation(query_desc: *mut pg_sys::QueryDesc) {
     if query_desc.is_null() {
@@ -38,7 +46,8 @@ pub fn collect_spans(query_desc: *mut pg_sys::QueryDesc) {
     }
     let wall_start = end_time - Duration::from_nanos(total as u64);
 
-    let Some(span) = HeaplessSpan::from_query(query_desc, wall_start) else {
+    let parent_span = get_span_context(query_desc);
+    let Some(span) = HeaplessSpan::from_query(query_desc, wall_start, &parent_span) else {
         return;
     };
 
@@ -168,4 +177,72 @@ pub fn pg_otel_wake_worker() -> bool {
     }
 
     unsafe { libc::kill(pid, libc::SIGINT) == 0 }
+}
+
+fn get_span_context(query_desc: *const pg_sys::QueryDesc) -> SpanContext {
+    if let Some(traceparent) = get_otlp_traceparent() {
+        parse_traceparent(&traceparent)
+    } else if let Some(traceparent) = get_traceparent_from_query_desc(query_desc) {
+        parse_traceparent(traceparent)
+    } else {
+        Context::new().span().span_context().clone()
+    }
+}
+
+struct FindIter<'a> {
+    text: &'a str,
+    pattern: &'a str,
+    offset: usize,
+}
+
+impl<'a> FindIter<'a> {
+    fn new(text: &'a str, pattern: &'a str) -> Self {
+        Self {
+            text,
+            pattern,
+            offset: 0,
+        }
+    }
+}
+
+impl<'a> Iterator for FindIter<'a> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let text = &self.text[self.offset..];
+        if let Some(start) = text.find(self.pattern) {
+            self.offset += start + self.pattern.len();
+            Some(self.offset - self.pattern.len())
+        } else {
+            None
+        }
+    }
+}
+
+// If string literals in the query text contain comments with traceparent values, so be it. I am not writing a full sql parser.
+fn get_traceparent_from_query_desc<'a>(query_desc: *const pg_sys::QueryDesc) -> Option<&'a str> {
+    let text = pg_str(unsafe { (*query_desc).sourceText })?;
+
+    let mut starts = FindIter::new(text, "/*").peekable();
+    let mut ends = FindIter::new(text, "*/").peekable();
+
+    while let Some(start) = starts.next() {
+        let mut rest = &text[start + 2..];
+        // handle nested block comments (because postgres supports those, grrrr)
+        while let (Some(start), Some(end)) = (starts.peek(), ends.next()) {
+            if *start > end {
+                rest = &rest[..end - 2];
+                break;
+            }
+            starts.next();
+        }
+
+        for token in rest.split_ascii_whitespace() {
+            if let Some(traceparent) = token.strip_prefix("pg_otel.traceparent=") {
+                return Some(traceparent);
+            }
+        }
+    }
+
+    None
 }

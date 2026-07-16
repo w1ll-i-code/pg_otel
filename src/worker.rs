@@ -12,65 +12,7 @@ use tonic::{
     transport::{Certificate, ClientTlsConfig},
 };
 
-use crate::{
-    span::HeaplessSpan, DEQUE, OTLP_AUTHORIZATION, OTLP_CA_CERTIFICATE, OTLP_ENDPOINT,
-    OTLP_PROTOCOL, OTLP_SERVICE_NAME, OTLP_TIMEOUT_MS,
-};
-
-#[derive(Clone, Debug)]
-pub struct ExporterConfig {
-    pub endpoint: String,
-    pub protocol: String,
-    pub timeout_ms: u32,
-    pub authorization: Option<String>,
-    pub ca_certificate: Option<String>,
-    pub service_name: String,
-}
-
-impl ExporterConfig {
-    fn load() -> Result<Self, String> {
-        let endpoint = OTLP_ENDPOINT
-            .get()
-            .ok_or_else(|| "OTLP endpoint is not configured".to_owned())?
-            .into_string()
-            .map_err(|_| "OTLP endpoint is not valid UTF-8".to_owned())?;
-        let protocol = OTLP_PROTOCOL
-            .get()
-            .ok_or_else(|| "OTLP protocol is not configured".to_owned())?
-            .into_string()
-            .map_err(|_| "OTLP protocol is not valid UTF-8".to_owned())?;
-        let authorization = OTLP_AUTHORIZATION
-            .get()
-            .map(|value| {
-                value
-                    .into_string()
-                    .map_err(|_| "OTLP authorization is not valid UTF-8".to_owned())
-            })
-            .transpose()?;
-        let ca_certificate = OTLP_CA_CERTIFICATE
-            .get()
-            .map(|value| {
-                value
-                    .into_string()
-                    .map_err(|_| "OTLP CA certificate path is not valid UTF-8".to_owned())
-            })
-            .transpose()?;
-        let service_name = OTLP_SERVICE_NAME
-            .get()
-            .and_then(|value| value.into_string().ok())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "postgresql".to_owned());
-
-        Ok(Self {
-            endpoint,
-            protocol,
-            timeout_ms: OTLP_TIMEOUT_MS.get() as u32,
-            authorization,
-            ca_certificate,
-            service_name,
-        })
-    }
-}
+use crate::{config::ExporterConfig, span::HeaplessSpan, DEQUE};
 
 pub fn background_worker_run() {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -103,14 +45,7 @@ pub fn background_worker_run() {
 }
 
 async fn build_exporter() -> Option<SpanExporter> {
-    let config = match ExporterConfig::load() {
-        Ok(config) => config,
-        Err(error) => {
-            log!("Could not load OTLP exporter configuration: {}", error);
-            return None;
-        }
-    };
-
+    let config = ExporterConfig::load()?;
     let endpoint = config.endpoint.clone();
     let timeout = Duration::from_millis(config.timeout_ms as u64);
     let protocol = config.protocol.to_ascii_lowercase();
