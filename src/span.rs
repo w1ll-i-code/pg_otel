@@ -1,6 +1,9 @@
 #![allow(dead_code)]
 
-use std::time::{Duration, SystemTime};
+use std::{
+    time::{Duration, SystemTime},
+    usize,
+};
 
 use opentelemetry::{
     trace::{SpanContext, SpanKind, Status, TraceState},
@@ -61,25 +64,22 @@ pub enum HeaplessSpanAttributes {
 
 impl HeaplessSpan {
     pub fn from_query(query_desc: *const QueryDesc, wall_start: SystemTime) -> Option<Self> {
-        let Some(query_desc) = (unsafe { query_desc.as_ref() }) else {
-            return None;
-        };
+        let query_desc = unsafe { query_desc.as_ref()? };
+        let plan_state = unsafe { (*query_desc).planstate.as_ref()? };
+        let instrument = unsafe { query_desc.query_instr.as_ref()? };
 
         let operation = query_desc.operation;
-        let name = heapless::String::try_from(query_name(operation)).unwrap();
-
-        let Some(instrument) = (unsafe { query_desc.query_instr.as_ref() }) else {
-            return None;
+        let name = {
+            let query_name = query_name(operation);
+            let mut tables = collect_table_names(plan_state as *const PlanState);
+            tables.sort_unstable();
+            String::from(query_name) + " " + &tables.join(", ")
         };
+
+        let query_text = pg_str(query_desc.sourceText).unwrap_or_default();
+
         let start_time = wall_start + Duration::from_nanos(instrument.starttime.ticks as u64);
         let end_time = start_time + Duration::from_nanos(instrument.total.ticks as u64);
-
-        let source_text = query_desc.sourceText;
-        let query_text = pg_str(source_text).unwrap_or_default();
-        let truncate = query_text.floor_char_boundary(QUERY_TEXT_MAX_LEN);
-        let query_text = &query_text[..truncate];
-        let query_text = heapless::String::try_from(query_text).expect("query_text was truncated.");
-
         let exec_startup_time_seconds = instrument.starttime.ticks as f64 / 1e9;
         let exec_total_time_seconds = instrument.total.ticks as f64 / 1e9;
 
@@ -87,12 +87,12 @@ impl HeaplessSpan {
             trace_id: TraceId::from(fastrand::u128(..)),
             span_id: SpanId::from(fastrand::u64(..)),
             parent_id: SpanId::INVALID,
-            name,
+            name: truncate(&name),
             start_time,
             end_time,
             attributes: HeaplessSpanAttributes::Query(QueryAttributes {
                 operation,
-                query_text,
+                query_text: truncate(&query_text),
                 exec_startup_time_seconds,
                 exec_total_time_seconds,
             }),
@@ -104,17 +104,9 @@ impl HeaplessSpan {
         wall_start: SystemTime,
         parent: &HeaplessSpan,
     ) -> Option<Self> {
-        let Some(plan_node) = (unsafe { plan_node.as_ref() }) else {
-            return None;
-        };
-
-        let Some(instrument) = (unsafe { plan_node.instrument.as_ref() }) else {
-            return None;
-        };
-
-        let Some(plan) = (unsafe { plan_node.plan.as_ref() }) else {
-            return None;
-        };
+        let plan_node = unsafe { plan_node.as_ref() }?;
+        let instrument = unsafe { plan_node.instrument.as_ref() }?;
+        let plan = unsafe { plan_node.plan.as_ref() }?;
 
         let start_time = wall_start + Duration::from_nanos(instrument.instr.starttime.ticks as u64);
         let end_time = wall_start + Duration::from_nanos(instrument.instr.total.ticks as u64);
@@ -124,7 +116,7 @@ impl HeaplessSpan {
         let table_suffix = plan_table_name(plan_node)
             .map(|table| format!(" [{}]", table))
             .unwrap_or_default();
-        let name = format!("postgres.operation.{:?}{}", plan_node.type_, table_suffix);
+        let name = format!("postgresql.operation.{:?}{}", plan_node.type_, table_suffix);
         let name_end = name.floor_char_boundary(PLAN_NODE_NAME_MAX_LEN);
         let name = heapless::String::try_from(&name[..name_end]).expect("name was truncated");
 
@@ -209,9 +201,9 @@ impl From<HeaplessSpan> for SpanData {
                     start_time: span.start_time,
                     end_time: span.end_time,
                     attributes: vec![
-                        KeyValue::new("db.system.name", "postgresql"),
-                        KeyValue::new("db.operation.name", operation),
-                        KeyValue::new("db.query.text", query_text),
+                        KeyValue::new("db.operation", operation),
+                        KeyValue::new("db.statement", query_text),
+                        KeyValue::new("db.system", "postgresql"),
                         KeyValue::new(
                             "postgresql.execution.startup_time_seconds",
                             attr.exec_startup_time_seconds,
@@ -220,6 +212,9 @@ impl From<HeaplessSpan> for SpanData {
                             "postgresql.execution.total_time_seconds",
                             attr.exec_total_time_seconds,
                         ),
+                        KeyValue::new("span.duration.us", attr.exec_total_time_seconds / 1e6),
+                        KeyValue::new("span.type", "db"),
+                        KeyValue::new("span.subtype", "postgresql"),
                     ],
                     dropped_attributes_count: 0,
                     events: Default::default(),
@@ -247,6 +242,7 @@ impl From<HeaplessSpan> for SpanData {
                     start_time: span.start_time,
                     end_time: span.end_time,
                     attributes: vec![
+                        KeyValue::new("db.system", "postgresql"),
                         KeyValue::new("postgresql.plan.node_type", node_type),
                         KeyValue::new(
                             "postgresql.plan.tables",
@@ -281,6 +277,9 @@ impl From<HeaplessSpan> for SpanData {
                             "postgresql.instrumentation.rows_removed_by_other_filter",
                             attr.instr_rows_removed_by_other_filter,
                         ),
+                        KeyValue::new("span.duration.us", attr.instr_total_time_seconds * 1e3),
+                        KeyValue::new("span.type", "db"),
+                        KeyValue::new("span.subtype", "internal"),
                     ],
                     dropped_attributes_count: 0,
                     events: Default::default(),
@@ -291,4 +290,20 @@ impl From<HeaplessSpan> for SpanData {
             }
         }
     }
+}
+
+pub fn truncate<const N: usize>(s: &str) -> heapless::String<N> {
+    let s = s.trim();
+    assert!(N > 3);
+    if s.len() <= N {
+        return heapless::String::try_from(s).expect("length was checked beforehand");
+    }
+
+    let truncate_at = s.floor_char_boundary(N - 3);
+    let mut truncated =
+        heapless::String::try_from(&s[..truncate_at]).expect("length was checked beforehand");
+    truncated
+        .push('…')
+        .expect("truncation left room for ellipsis");
+    truncated
 }

@@ -1,5 +1,6 @@
 use std::{collections::HashMap, fs, time::Duration};
 
+use opentelemetry::KeyValue;
 use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithHttpConfig, WithTonicConfig};
 use opentelemetry_sdk::{
     trace::{SpanData, SpanExporter as _},
@@ -58,7 +59,7 @@ impl ExporterConfig {
             .get()
             .and_then(|value| value.into_string().ok())
             .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "postgres".to_owned());
+            .unwrap_or_else(|| "postgresql".to_owned());
 
         Ok(Self {
             endpoint,
@@ -172,14 +173,8 @@ async fn build_exporter() -> Option<SpanExporter> {
             let resource = Resource::builder()
                 .with_service_name(config.service_name)
                 .with_attributes([
-                    opentelemetry::KeyValue::new("telemetry.sdk.name", "opentelemetry"),
-                    opentelemetry::KeyValue::new("telemetry.sdk.language", "rust"),
-                    opentelemetry::KeyValue::new("service.framework.name", "postgres"),
-                    opentelemetry::KeyValue::new("service.framework.version", "19"),
-                    opentelemetry::KeyValue::new(
-                        "telemetry.sdk.version",
-                        env!("CARGO_PKG_VERSION"),
-                    ),
+                    KeyValue::new("service.framework.name", "postgresql"),
+                    KeyValue::new("service.framework.version", "19"),
                 ])
                 .build();
             exporter.set_resource(&resource);

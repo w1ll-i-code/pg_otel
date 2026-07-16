@@ -45,7 +45,7 @@ pub static OTLP_CA_CERTIFICATE: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
 
 pub static OTLP_SERVICE_NAME: GucSetting<Option<std::ffi::CString>> =
-    GucSetting::<Option<std::ffi::CString>>::new(Some(c"postgres"));
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"postgresql"));
 
 #[test]
 fn test() {
