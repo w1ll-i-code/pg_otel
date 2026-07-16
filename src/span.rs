@@ -6,10 +6,11 @@ use std::{
 };
 
 use opentelemetry::{
-    trace::{SpanContext, SpanKind, Status, TraceState},
+    propagation::{Extractor, TextMapPropagator},
+    trace::{SpanContext, SpanKind, Status, TraceContextExt, TraceState},
     Array, InstrumentationScope, KeyValue, SpanId, StringValue, TraceFlags, TraceId, Value,
 };
-use opentelemetry_sdk::trace::SpanData;
+use opentelemetry_sdk::{propagation::TraceContextPropagator, trace::SpanData};
 use pgrx::{
     log,
     pg_sys::{CmdType, NodeTag, PlanState, QueryDesc},
@@ -63,7 +64,11 @@ pub enum HeaplessSpanAttributes {
 }
 
 impl HeaplessSpan {
-    pub fn from_query(query_desc: *const QueryDesc, wall_start: SystemTime) -> Option<Self> {
+    pub fn from_query(
+        query_desc: *const QueryDesc,
+        wall_start: SystemTime,
+        parent_span: &SpanContext,
+    ) -> Option<Self> {
         let query_desc = unsafe { query_desc.as_ref()? };
         let plan_state = unsafe { (*query_desc).planstate.as_ref()? };
         let instrument = unsafe { query_desc.query_instr.as_ref()? };
@@ -84,9 +89,9 @@ impl HeaplessSpan {
         let exec_total_time_seconds = instrument.total.ticks as f64 / 1e9;
 
         Some(HeaplessSpan {
-            trace_id: TraceId::from(fastrand::u128(..)),
+            trace_id: parent_span.trace_id(),
             span_id: SpanId::from(fastrand::u64(..)),
-            parent_id: SpanId::INVALID,
+            parent_id: parent_span.span_id(),
             name: truncate(&name),
             start_time,
             end_time,
@@ -306,4 +311,34 @@ pub fn truncate<const N: usize>(s: &str) -> heapless::String<N> {
         .push('…')
         .expect("truncation left room for ellipsis");
     truncated
+}
+
+struct TraceParentExtractor<'a> {
+    parent: &'a str,
+}
+
+impl<'a> TraceParentExtractor<'a> {
+    pub fn new(parent: &'a str) -> Self {
+        Self { parent }
+    }
+}
+
+impl<'a> Extractor for TraceParentExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        if key.eq_ignore_ascii_case("traceparent") {
+            Some(self.parent)
+        } else {
+            None
+        }
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        vec!["traceparent"]
+    }
+}
+
+pub fn parse_traceparent(s: &str) -> SpanContext {
+    let propagator = TraceContextPropagator::default();
+    let extractor = TraceParentExtractor::new(s);
+    propagator.extract(&extractor).span().span_context().clone()
 }
