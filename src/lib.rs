@@ -21,24 +21,12 @@ mod worker;
 
 ::pgrx::pg_module_magic!(name, version);
 
-/// In order to use this bgworker with pgrx, you'll need to edit the proper `postgresql.conf` file in
-/// "${PGRX_HOME}/data-$PGVER/postgresql.conf" and add this line to the end:
-///
-/// ```
-/// shared_preload_libraries = 'pg_otel.so'
-/// ```
-
 static DEQUE: PgLwLock<AssertPGRXSharedMemory<heapless::spsc::Queue<HeaplessSpan, 1024>>> =
     unsafe { PgLwLock::new(c"pg_otel_worker_deque") };
 
 // The PID is published by the worker after it starts. A zero value means that
 // the worker has not started (or has already exited).
 static WORKER_PID: PgAtomic<AtomicI32> = unsafe { PgAtomic::new(c"pg_otel_worker_pid") };
-#[test]
-fn test() {
-    dbg!(std::mem::size_of::<HeaplessSpan>());
-    dbg!(std::mem::size_of::<heapless::spsc::Queue<HeaplessSpan, 1024>>());
-}
 
 // This is a global variable accross all plugins. We store the previous hook so we can execute it before our
 // own hook. This is important because we want to make sure that the previous hook is executed before our own
@@ -60,8 +48,6 @@ pub extern "C-unwind" fn _PG_init() {
     BackgroundWorkerBuilder::new("Background Worker Example")
         .set_function("background_worker_main")
         .set_library("pg_otel")
-        .set_argument(42i32.into_datum())
-        .enable_spi_access()
         .load();
 
     // SAFETY: This is called once by postgres

@@ -63,7 +63,8 @@ Clone the repository and run `cargo build` to build the plugin.
 
 Right now, the queue length is hardcoded to 1024 spans. This means that if
 you have a large number of concurrent queries, some may be dropped if the queue
-is full.
+is full. Additionally, table and span names are truncated to 64 characters and
+the query text is truncated to 512 characters.
 
 
 ## Acknowledgements
