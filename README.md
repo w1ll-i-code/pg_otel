@@ -35,6 +35,23 @@ pg_otel.otlp_authorization = 'ApiKey ...'; # Set the contents of the Authorizati
 pg_otel.otlp_ca_certificate = ''; # Set the path to the CA certificate file if you have a custom CA
 ```
 
+## Usage
+
+To link the generated traces to the correct parent spans, you need to pass the
+`traceparent` to postgres. This can be done by setting the `pg_otel.traceparent`
+GUC like so: 
+
+```sql
+SET pg_otel.traceparent = '<traceparent>';
+```
+
+Alternatively, you can add the `traceparent` to a comment in the query like so:
+
+```sql
+SELECT * /* pg_otel.traceparent=<traceparent> */
+FROM my_table
+WHERE id = 1;
+```
 
 ## Building
 
