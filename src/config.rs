@@ -273,7 +273,6 @@ fn define_queue_size_kb_guc() {
 }
 
 /// Returns the shared span queue size in kilobytes.
-#[allow(dead_code)] // wired in later phase
 pub fn get_queue_size_kb() -> i32 {
     QUEUE_SIZE_KB.get()
 }

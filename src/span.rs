@@ -1,19 +1,19 @@
-use std::time::{Duration, SystemTime};
+use std::{
+    collections::BTreeSet,
+    time::{Duration, SystemTime},
+};
 
 use opentelemetry::{
-    Array, InstrumentationScope, KeyValue, SpanId, StringValue, TraceFlags, TraceId, Value,
+    InstrumentationScope, KeyValue, SpanId, TraceFlags, TraceId,
     propagation::{Extractor, TextMapPropagator},
     trace::{SpanContext, SpanKind, Status, TraceContextExt, TraceState},
 };
 use opentelemetry_sdk::{propagation::TraceContextPropagator, trace::SpanData};
-use pgrx::{
-    log,
-    pg_sys::{self, CmdType, NodeInstrumentation, NodeTag, PlanState, QueryDesc},
-};
+use pgrx::pg_sys::{self, CmdType, NodeInstrumentation, PlanState, QueryDesc};
 
 use crate::{
     config::QueryTextMode,
-    postgres::{collect_table_names, instr_ticks_to_ns, plan_table_name},
+    postgres::{instr_ticks_to_ns, plan_table_name},
     sanitize,
 };
 
@@ -78,97 +78,135 @@ pub fn random_span_id() -> SpanId {
     }
 }
 
-pub const QUERY_TEXT_MAX_LEN: usize = 512;
-const PLAN_NODE_NAME_MAX_LEN: usize = 64;
-const PLAN_TABLES_MAX_LEN: usize = 12;
+/// Longest query text exported, in bytes.
+pub const QUERY_TEXT_MAX_LEN: usize = 4096;
+/// Longest span name and relation name exported, in bytes.
+const NAME_MAX_LEN: usize = 256;
 
-pub struct HeaplessSpan {
+/// A finished span as passed from backends to the exporter worker.
+///
+/// It owns its data; [`crate::codec`] turns it into the bytes that travel
+/// through the shared-memory queue and back.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpanRecord {
     pub trace_id: TraceId,
     pub span_id: SpanId,
     pub parent_id: SpanId,
-    pub name: heapless::String<PLAN_NODE_NAME_MAX_LEN>,
+    pub name: String,
     pub start_time: SystemTime,
     pub end_time: SystemTime,
-    pub attributes: HeaplessSpanAttributes,
+    pub attributes: SpanAttributes,
 }
 
+/// What children of a span need to know about it.
+#[derive(Clone, Copy, Debug)]
+pub struct SpanLink {
+    pub trace_id: TraceId,
+    pub span_id: SpanId,
+    pub end_time: SystemTime,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct QueryAttributes {
-    parent_is_remote: bool,
-    operation: CmdType::Type,
+    pub parent_is_remote: bool,
+    /// `SELECT`, `UPDATE`, ...
+    pub operation: String,
     /// `None` when `pg_otel.query_text` is `off` or the text could not be
     /// produced safely.
-    query_text: Option<heapless::String<QUERY_TEXT_MAX_LEN>>,
+    pub query_text: Option<String>,
     /// Postgres' query id; `0` means it was not computed.
-    query_id: i64,
-    exec_total_time_ns: i64,
+    pub query_id: i64,
+    pub exec_total_time_ns: i64,
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub struct PlanNodeAttributes {
-    plan_node_type: NodeTag,
-    plan_tables: heapless::Vec<heapless::String<PLAN_NODE_NAME_MAX_LEN>, PLAN_TABLES_MAX_LEN>,
-    plan_startup_cost: f64,
-    plan_total_cost: f64,
-    plan_rows: f64,
-    plan_width_bytes: i32,
-    plan_parallel_aware: bool,
-    plan_parallel_safe: bool,
-    plan_async_capable: bool,
-    instr_startup_time_ns: i64,
-    instr_total_time_ns: i64,
-    instr_rows: f64,
-    instr_secondary_rows: f64,
-    instr_loops: f64,
-    instr_rows_removed_by_scan_or_join_filter: f64,
-    instr_rows_removed_by_other_filter: f64,
+    /// Debug name of the plan state node tag, e.g. `T_SeqScanState`.
+    pub node_type: String,
+    /// `schema.table` scanned by this node itself (not by its children).
+    pub relation: Option<String>,
+    pub startup_cost: f64,
+    pub total_cost: f64,
+    pub rows: f64,
+    pub width_bytes: i32,
+    pub parallel_aware: bool,
+    pub parallel_safe: bool,
+    pub async_capable: bool,
+    pub instr_startup_time_ns: i64,
+    pub instr_total_time_ns: i64,
+    pub instr_rows: f64,
+    pub instr_secondary_rows: f64,
+    pub instr_loops: f64,
+    pub instr_rows_removed_by_scan_or_join_filter: f64,
+    pub instr_rows_removed_by_other_filter: f64,
 }
 
-// The spans live inline in a shared-memory queue, so the larger variant cannot
-// be boxed (a pointer would be meaningless in another process).
-#[allow(clippy::large_enum_variant)]
-pub enum HeaplessSpanAttributes {
+#[derive(Clone, Debug, PartialEq)]
+pub enum SpanAttributes {
     Query(QueryAttributes),
     PlanNode(PlanNodeAttributes),
 }
 
-impl HeaplessSpan {
+impl SpanRecord {
+    pub fn link(&self) -> SpanLink {
+        SpanLink {
+            trace_id: self.trace_id,
+            span_id: self.span_id,
+            end_time: self.end_time,
+        }
+    }
+
+    /// The relation scanned by this plan node itself, if any.
+    pub fn relation(&self) -> Option<&str> {
+        match &self.attributes {
+            SpanAttributes::PlanNode(node) => node.relation.as_deref(),
+            SpanAttributes::Query(_) => None,
+        }
+    }
+
     /// Builds the span of a whole statement.
     ///
     /// The span covers `wall_start` up to the time Postgres spent in
-    /// ExecutorRun/Finish (`query_instr.total`). Calls into Postgres to
-    /// sanitize the query text, so it must not run while the span queue lock is
-    /// held.
+    /// ExecutorRun/Finish (`query_instr.total`). `span_id` is chosen by the
+    /// caller so plan nodes can reference it as their parent before this span
+    /// exists, and `tables` are the relations scanned by the plan. Calls into
+    /// Postgres to sanitize the query text, so it must not run while the span
+    /// queue lock is held.
     pub fn from_query(
         query_desc: *const QueryDesc,
         wall_start: SystemTime,
         parent: &ParentContext,
         query_text_mode: QueryTextMode,
+        span_id: SpanId,
+        tables: &BTreeSet<String>,
     ) -> Option<Self> {
         let query_desc = unsafe { query_desc.as_ref()? };
-        let plan_state = unsafe { query_desc.planstate.as_ref()? };
         let instrument = unsafe { query_desc.query_instr.as_ref()? };
 
-        let operation = query_desc.operation;
-        let name = {
-            let query_name = query_name(operation);
-            let mut tables = collect_table_names(plan_state as *const PlanState);
-            tables.sort_unstable();
-            String::from(query_name) + " " + &tables.join(", ")
-        };
+        let operation = query_name(query_desc.operation);
+        let name = format!(
+            "{operation} {}",
+            tables
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
 
         let total_ns = instr_ticks_to_ns(instrument.total.ticks).max(0);
         let end_time = wall_start + Duration::from_nanos(total_ns as u64);
         let (query_text, query_id) = exported_query_text_and_id(query_desc, query_text_mode);
 
-        Some(HeaplessSpan {
+        Some(SpanRecord {
             trace_id: parent.trace_id,
-            span_id: random_span_id(),
+            span_id,
             parent_id: parent.span_id,
-            name: truncate(&name),
+            name: truncated(&name, NAME_MAX_LEN),
             start_time: wall_start,
             end_time,
-            attributes: HeaplessSpanAttributes::Query(QueryAttributes {
+            attributes: SpanAttributes::Query(QueryAttributes {
                 parent_is_remote: parent.is_remote,
-                operation,
+                operation: operation.to_owned(),
                 query_text,
                 query_id,
                 exec_total_time_ns: total_ns,
@@ -184,7 +222,7 @@ impl HeaplessSpan {
     pub fn from_plan(
         plan_node: *mut PlanState,
         wall_start: SystemTime,
-        parent: &HeaplessSpan,
+        parent: &SpanLink,
     ) -> Option<Self> {
         let plan_node = unsafe { plan_node.as_ref() }?;
         let instrument = unsafe { finished_node_instrumentation(plan_node.instrument) }?;
@@ -194,43 +232,31 @@ impl HeaplessSpan {
         let startup_ns = instr_ticks_to_ns(instrument.startup.ticks).max(0);
         let end_time = (wall_start + Duration::from_nanos(total_ns as u64)).min(parent.end_time);
 
-        let plan_table_names = collect_table_names(plan_node);
-        let plan_table_len = plan_table_names.len();
-        let table_suffix = plan_table_name(plan_node)
-            .map(|table| format!(" [{}]", table))
+        let relation = plan_table_name(plan_node).map(|table| truncated(&table, NAME_MAX_LEN));
+        let table_suffix = relation
+            .as_deref()
+            .map(|table| format!(" [{table}]"))
             .unwrap_or_default();
-        let name = format!("postgresql.operation.{:?}{}", plan_node.type_, table_suffix);
-        let name_end = name.floor_char_boundary(PLAN_NODE_NAME_MAX_LEN);
-        let name = heapless::String::try_from(&name[..name_end]).expect("name was truncated");
+        let node_type = format!("{:?}", plan_node.type_);
+        let name = format!("postgresql.operation.{node_type}{table_suffix}");
 
-        let mut plan_tables = heapless::Vec::new();
-        for table_name in plan_table_names {
-            if let Ok(table_name) = heapless::String::try_from(table_name.as_str()) {
-                if plan_tables.push(table_name).is_err() {
-                    log!("Too many plan table names: {}", plan_table_len);
-                }
-            } else {
-                log!("Plan table name too long: {}", table_name);
-            }
-        }
-
-        Some(HeaplessSpan {
+        Some(SpanRecord {
             trace_id: parent.trace_id,
             span_id: random_span_id(),
             parent_id: parent.span_id,
-            name,
+            name: truncated(&name, NAME_MAX_LEN),
             start_time: wall_start,
             end_time,
-            attributes: HeaplessSpanAttributes::PlanNode(PlanNodeAttributes {
-                plan_node_type: plan_node.type_,
-                plan_startup_cost: plan.startup_cost,
-                plan_total_cost: plan.total_cost,
-                plan_rows: plan.plan_rows,
-                plan_width_bytes: plan.plan_width,
-                plan_parallel_aware: plan.parallel_aware,
-                plan_parallel_safe: plan.parallel_safe,
-                plan_async_capable: plan.async_capable,
-                plan_tables,
+            attributes: SpanAttributes::PlanNode(PlanNodeAttributes {
+                node_type,
+                relation,
+                startup_cost: plan.startup_cost,
+                total_cost: plan.total_cost,
+                rows: plan.plan_rows,
+                width_bytes: plan.plan_width,
+                parallel_aware: plan.parallel_aware,
+                parallel_safe: plan.parallel_safe,
+                async_capable: plan.async_capable,
                 instr_startup_time_ns: startup_ns,
                 instr_total_time_ns: total_ns,
                 instr_rows: instrument.ntuples,
@@ -241,6 +267,11 @@ impl HeaplessSpan {
             }),
         })
     }
+}
+
+/// `s` cut to at most `max_bytes` bytes on a character boundary.
+fn truncated(s: &str, max_bytes: usize) -> String {
+    sanitize::truncate_utf8(s, max_bytes).to_owned()
 }
 
 /// Folds the node's last execution cycle into its totals (as `ExplainNode`
@@ -274,7 +305,7 @@ unsafe fn finished_node_instrumentation<'a>(
 fn exported_query_text_and_id(
     query_desc: &QueryDesc,
     mode: QueryTextMode,
-) -> (Option<heapless::String<QUERY_TEXT_MAX_LEN>>, i64) {
+) -> (Option<String>, i64) {
     // SAFETY: `plannedstmt` is null or valid for the duration of the hook.
     let (stmt_location, stmt_len, query_id) = match unsafe { query_desc.plannedstmt.as_ref() } {
         Some(stmt) => (stmt.stmt_location, stmt.stmt_len, stmt.queryId),
@@ -282,8 +313,8 @@ fn exported_query_text_and_id(
     };
     let text = normalize_for(mode).and_then(|normalize| {
         // SAFETY: `sourceText` is null or a NUL-terminated string that outlives
-        // the hook. `sanitize` truncates to the capacity of the target string.
-        let text = unsafe {
+        // the hook. `sanitize` truncates to `QUERY_TEXT_MAX_LEN`.
+        unsafe {
             sanitize::sanitize(
                 query_desc.sourceText,
                 stmt_location,
@@ -291,8 +322,7 @@ fn exported_query_text_and_id(
                 normalize,
                 QUERY_TEXT_MAX_LEN,
             )
-        }?;
-        heapless::String::try_from(text.as_str()).ok()
+        }
     });
     (text, query_id)
 }
@@ -329,8 +359,8 @@ fn query_name(command: CmdType::Type) -> &'static str {
     }
 }
 
-impl From<HeaplessSpan> for SpanData {
-    fn from(span: HeaplessSpan) -> Self {
+impl From<SpanRecord> for SpanData {
+    fn from(span: SpanRecord) -> Self {
         let span_context = SpanContext::new(
             span.trace_id,
             span.span_id,
@@ -344,11 +374,10 @@ impl From<HeaplessSpan> for SpanData {
             .build();
 
         match span.attributes {
-            HeaplessSpanAttributes::Query(attr) => {
-                let operation = query_name(attr.operation);
+            SpanAttributes::Query(attr) => {
                 let mut attributes = vec![
-                    KeyValue::new("db.operation", operation),
-                    KeyValue::new("db.system", "postgresql"),
+                    KeyValue::new("db.operation.name", attr.operation),
+                    KeyValue::new("db.system.name", "postgresql"),
                     KeyValue::new(
                         "postgresql.execution.total_time_seconds",
                         ns_to_seconds(attr.exec_total_time_ns),
@@ -357,11 +386,8 @@ impl From<HeaplessSpan> for SpanData {
                     KeyValue::new("span.type", "db"),
                     KeyValue::new("span.subtype", "postgresql"),
                 ];
-                if let Some(query_text) = &attr.query_text {
-                    attributes.push(KeyValue::new(
-                        "db.query.text",
-                        query_text.as_str().to_owned(),
-                    ));
+                if let Some(query_text) = attr.query_text {
+                    attributes.push(KeyValue::new("db.query.text", query_text));
                 }
                 if attr.query_id != 0 {
                     attributes.push(KeyValue::new("db.query.id", attr.query_id));
@@ -372,7 +398,7 @@ impl From<HeaplessSpan> for SpanData {
                     parent_span_id: span.parent_id,
                     parent_span_is_remote: attr.parent_is_remote,
                     span_kind: SpanKind::Server,
-                    name: span.name.as_str().to_owned().into(),
+                    name: span.name.into(),
                     start_time: span.start_time,
                     end_time: span.end_time,
                     attributes,
@@ -383,64 +409,58 @@ impl From<HeaplessSpan> for SpanData {
                     instrumentation_scope,
                 }
             }
-            HeaplessSpanAttributes::PlanNode(attr) => {
-                let node_type = format!("{:?}", attr.plan_node_type);
-
-                let plan_tables = attr
-                    .plan_tables
-                    .iter()
-                    .map(ToString::to_string)
-                    .map(StringValue::from)
-                    .collect::<Vec<_>>();
+            SpanAttributes::PlanNode(attr) => {
+                let mut attributes = vec![
+                    KeyValue::new("db.system.name", "postgresql"),
+                    KeyValue::new("postgresql.plan.node_type", attr.node_type),
+                ];
+                if let Some(relation) = attr.relation {
+                    attributes.push(KeyValue::new("postgresql.plan.relation", relation));
+                }
+                attributes.extend([
+                    KeyValue::new("postgresql.plan.startup_cost", attr.startup_cost),
+                    KeyValue::new("postgresql.plan.total_cost", attr.total_cost),
+                    KeyValue::new("postgresql.plan.rows", attr.rows),
+                    KeyValue::new("postgresql.plan.width_bytes", attr.width_bytes as i64),
+                    KeyValue::new("postgresql.plan.parallel_aware", attr.parallel_aware),
+                    KeyValue::new("postgresql.plan.parallel_safe", attr.parallel_safe),
+                    KeyValue::new("postgresql.plan.async_capable", attr.async_capable),
+                    KeyValue::new(
+                        "postgresql.instrumentation.startup_time_seconds",
+                        ns_to_seconds(attr.instr_startup_time_ns),
+                    ),
+                    KeyValue::new(
+                        "postgresql.instrumentation.total_time_seconds",
+                        ns_to_seconds(attr.instr_total_time_ns),
+                    ),
+                    KeyValue::new("postgresql.instrumentation.rows", attr.instr_rows),
+                    KeyValue::new(
+                        "postgresql.instrumentation.secondary_rows",
+                        attr.instr_secondary_rows,
+                    ),
+                    KeyValue::new("postgresql.instrumentation.loops", attr.instr_loops),
+                    KeyValue::new(
+                        "postgresql.instrumentation.rows_removed_by_scan_or_join_filter",
+                        attr.instr_rows_removed_by_scan_or_join_filter,
+                    ),
+                    KeyValue::new(
+                        "postgresql.instrumentation.rows_removed_by_other_filter",
+                        attr.instr_rows_removed_by_other_filter,
+                    ),
+                    KeyValue::new("span.duration.us", ns_to_micros(attr.instr_total_time_ns)),
+                    KeyValue::new("span.type", "db"),
+                    KeyValue::new("span.subtype", "internal"),
+                ]);
 
                 SpanData {
                     span_context,
                     parent_span_id: span.parent_id,
                     parent_span_is_remote: false,
                     span_kind: SpanKind::Internal,
-                    name: span.name.as_str().to_owned().into(),
+                    name: span.name.into(),
                     start_time: span.start_time,
                     end_time: span.end_time,
-                    attributes: vec![
-                        KeyValue::new("db.system", "postgresql"),
-                        KeyValue::new("postgresql.plan.node_type", node_type),
-                        KeyValue::new(
-                            "postgresql.plan.tables",
-                            Value::Array(Array::String(plan_tables)),
-                        ),
-                        KeyValue::new("postgresql.plan.startup_cost", attr.plan_startup_cost),
-                        KeyValue::new("postgresql.plan.total_cost", attr.plan_total_cost),
-                        KeyValue::new("postgresql.plan.rows", attr.plan_rows),
-                        KeyValue::new("postgresql.plan.width_bytes", attr.plan_width_bytes as i64),
-                        KeyValue::new("postgresql.plan.parallel_aware", attr.plan_parallel_aware),
-                        KeyValue::new("postgresql.plan.parallel_safe", attr.plan_parallel_safe),
-                        KeyValue::new("postgresql.plan.async_capable", attr.plan_async_capable),
-                        KeyValue::new(
-                            "postgresql.instrumentation.startup_time_seconds",
-                            ns_to_seconds(attr.instr_startup_time_ns),
-                        ),
-                        KeyValue::new(
-                            "postgresql.instrumentation.total_time_seconds",
-                            ns_to_seconds(attr.instr_total_time_ns),
-                        ),
-                        KeyValue::new("postgresql.instrumentation.rows", attr.instr_rows),
-                        KeyValue::new(
-                            "postgresql.instrumentation.secondary_rows",
-                            attr.instr_secondary_rows,
-                        ),
-                        KeyValue::new("postgresql.instrumentation.loops", attr.instr_loops),
-                        KeyValue::new(
-                            "postgresql.instrumentation.rows_removed_by_scan_or_join_filter",
-                            attr.instr_rows_removed_by_scan_or_join_filter,
-                        ),
-                        KeyValue::new(
-                            "postgresql.instrumentation.rows_removed_by_other_filter",
-                            attr.instr_rows_removed_by_other_filter,
-                        ),
-                        KeyValue::new("span.duration.us", ns_to_micros(attr.instr_total_time_ns)),
-                        KeyValue::new("span.type", "db"),
-                        KeyValue::new("span.subtype", "internal"),
-                    ],
+                    attributes,
                     dropped_attributes_count: 0,
                     events: Default::default(),
                     links: Default::default(),
@@ -450,22 +470,6 @@ impl From<HeaplessSpan> for SpanData {
             }
         }
     }
-}
-
-pub fn truncate<const N: usize>(s: &str) -> heapless::String<N> {
-    let s = s.trim();
-    assert!(N > 3);
-    if s.len() <= N {
-        return heapless::String::try_from(s).expect("length was checked beforehand");
-    }
-
-    let truncate_at = s.floor_char_boundary(N - 3);
-    let mut truncated =
-        heapless::String::try_from(&s[..truncate_at]).expect("length was checked beforehand");
-    truncated
-        .push('…')
-        .expect("truncation left room for ellipsis");
-    truncated
 }
 
 struct TraceParentExtractor<'a> {

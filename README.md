@@ -8,7 +8,12 @@ start hook, it requests the instrumentation for the query plan for each query.
 This will cost some CPU and memory, but the overhead is minimal for most
 queries. The end hook then collects all the data and sends it to a background
 worker to export the data. This allows the plugin to be as lightweight as
-possible. 
+possible.
+
+Requesting instrumentation turns on per-plan-node timers (`INSTRUMENT_TIMER`),
+which call the system clock around every row a node produces. That is cheap for
+most queries but measurable for queries that process very many rows, which is
+why tracing is off unless `pg_otel.min_duration_ms` is set.
 
 To reduce the number of spans being generated and sent, it only sends spans for
 statements that take at least `pg_otel.min_duration_ms`. Set it to `0` to send
@@ -57,7 +62,7 @@ pg_otel.min_duration_ms = 0 # -1 (default) disables tracing, 0 traces every stat
 | `pg_otel.traceparent` | string | unset | any user, per session/transaction | W3C `traceparent` of the parent span. See [Usage](#usage). |
 | `pg_otel.query_text` | enum | `normalized` | **superuser** (or roles granted `SET` on the parameter) | `off`: no query text. `normalized`: literals are replaced with placeholders (quoted identifiers such as `"My Table"` are kept as is). `raw`: the query text as received (may contain sensitive data). With `normalized`, databases whose encoding is not UTF-8 (for example `SQL_ASCII`) produce no query text, because normalization fails closed. |
 | `pg_otel.min_duration_ms` | int (ms) | `-1` | **superuser** (or roles granted `SET` on the parameter) | Only export spans for statements that run at least this long. `-1` disables tracing, `0` traces every statement. Restricted to superusers so that regular users cannot force tracing of everything. |
-| `pg_otel.queue_size_kb` | int (kB) | `1024` | server start only | Size of the shared-memory span queue (64 to 1048576). Needs a restart because shared memory is allocated at startup. |
+| `pg_otel.queue_size_kb` | int (kB) | `1024` | server start only | Size of the shared-memory span queue in kilobytes (64 to 1048576). Needs a restart because shared memory is allocated at startup. See [How spans are exported](#how-spans-are-exported). |
 
 All `pg_otel.*` names are reserved: `SET` and `ALTER SYSTEM` reject unknown
 `pg_otel.*` names, and unknown entries in `postgresql.conf` are warned about
@@ -69,10 +74,46 @@ and clients; the old names are no longer used by the extension.
 
 `pg_otel.query_text` is applied to the exported statement: only the statement
 being executed is exported (not other statements of a multi-statement string),
-cut to 512 bytes. In `off` mode no `db.query.text` attribute is set.
+cut to 4096 bytes. In `off` mode no `db.query.text` attribute is set.
 
-> **Note:** `pg_otel.queue_size_kb` is registered but not yet applied; the queue
-> length is still fixed at 1024 spans.
+## How spans are exported
+
+Backends build all spans of a statement in local memory and then put them in a
+byte ring buffer in shared memory (`pg_otel.queue_size_kb`) in one step, taking
+a lock only for the copy. A statement's spans are queued all together or not at
+all: if they do not fit, they are dropped and counted, never cut in half.
+
+A background worker (`pg_otel exporter`) takes the records out in chunks and
+exports them over OTLP. Backends wake it through its latch when the queue was
+empty or is more than half full; otherwise it checks once a second. On shutdown
+it exports what is still queued for at most five seconds. Postgres restarts the
+worker 10 seconds after it exits unexpectedly, and the worker deliberately
+exits with a non-zero status when it is terminated (for example with
+`pg_terminate_backend()`) so that it comes back instead of exporting silently
+stopping. The postmaster does not restart it during a server shutdown, but it
+does log `background worker "pg_otel exporter" ... exited with exit code 1` at
+`LOG` level on every stop; that message is expected.
+
+The worker empties the queue on every wake-up. A slow or unreachable collector
+therefore delays export (each failed export takes up to
+`pg_otel.otlp_timeout_ms`) and can make the queue fill up, but never delays a
+server shutdown or configuration reload by more than the export in progress.
+
+If the queue overflows (collector too slow or down, or a burst of statements),
+spans are dropped. The worker logs the number at most once a minute, and the
+total since server start is available in SQL:
+
+```sql
+SELECT pg_otel_dropped_spans();
+```
+
+`pg_otel_dropped_spans()` was added in version 0.2.0. After installing the new
+binaries and restarting the server (the library is preloaded), run
+`ALTER EXTENSION pg_otel UPDATE;` in each database that has the extension to
+create it.
+
+Raise `pg_otel.queue_size_kb` if this number grows. A single statement whose
+spans together exceed the queue size can never be exported.
 
 ## Usage
 
@@ -124,16 +165,33 @@ Query span attributes:
 
 | Attribute | Description |
 | --- | --- |
-| `db.system` | Always `postgresql`. |
-| `db.operation` | `SELECT`, `INSERT`, ... |
+| `db.system.name` | Always `postgresql`. |
+| `db.operation.name` | `SELECT`, `INSERT`, ... |
 | `db.query.text` | The statement, according to `pg_otel.query_text`. Absent in `off` mode (and in `normalized` mode when normalization is not possible). |
 | `db.query.id` | Postgres' query id; only present when it is computed (`compute_query_id`, for example enabled by `pg_stat_statements`). |
 | `postgresql.execution.total_time_seconds` | Time spent executing the statement, in seconds. |
 | `span.duration.us` | The same duration in **microseconds**. |
 
-Plan node spans carry `postgresql.plan.*` (planner estimates) and
-`postgresql.instrumentation.*` (actual rows, loops, filtered rows, startup and
-total time in seconds) attributes, plus `span.duration.us` in microseconds.
+Plan node spans carry `db.system.name`, `postgresql.plan.*` (planner estimates
+and `postgresql.plan.relation`, the `schema.table` this node itself scans, if
+any) and `postgresql.instrumentation.*` (actual rows, loops, filtered rows,
+startup and total time in seconds) attributes, plus `span.duration.us` in
+microseconds. The query span's name lists all relations of the plan.
+
+### Breaking changes in the exported data
+
+If you have dashboards or alerts on earlier versions of this extension:
+
+| Before | Now |
+| --- | --- |
+| `db.statement` | `db.query.text` (sanitized according to `pg_otel.query_text`) |
+| `db.system` | `db.system.name` (current OpenTelemetry semantic conventions) |
+| `db.operation` | `db.operation.name` |
+| `postgresql.plan.tables` (list of all relations below the node) | `postgresql.plan.relation` (only the node's own relation) |
+| `postgresql.execution.startup_time_seconds` | removed (it was always 0) |
+| `span.duration.us` | now really microseconds (it used to be off by a factor of 1000 or 1e6) |
+| span timestamps and durations | converted from Postgres' clock ticks to nanoseconds (they were wrong on machines where the ticks are not nanoseconds) |
+| span names | no longer cut to 64 characters (now 256 bytes) |
 
 Timing notes: Postgres only records accumulated durations, not wall-clock
 timestamps, per plan node. The query span starts at the time the statement began
@@ -151,10 +209,11 @@ Clone the repository and run `cargo build` to build the plugin.
 
 ## Limitations
 
-Right now, the queue length is hardcoded to 1024 spans. This means that if
-you have a large number of concurrent queries, some may be dropped if the queue
-is full. Additionally, table and span names are truncated to 64 characters and
-the query text is truncated to 512 characters.
+The span queue has a fixed size (`pg_otel.queue_size_kb`); spans are dropped
+when it is full (see [How spans are exported](#how-spans-are-exported)). Span
+and relation names are truncated to 256 bytes and the query text to 4096 bytes.
+Plan nodes below `Append`/`MergeAppend`, sub-plans and init-plans are not
+reported yet.
 
 
 ## Acknowledgements

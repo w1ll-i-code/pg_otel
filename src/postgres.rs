@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    collections::BTreeSet,
     ffi::CStr,
     panic::AssertUnwindSafe,
     sync::atomic::{AtomicBool, Ordering},
@@ -17,9 +18,10 @@ use pgrx::{
 };
 
 use crate::{
-    DEQUE, WORKER_PID,
+    codec::encode_batch,
     config::{get_min_duration_ms, get_otlp_traceparent, get_query_text_mode},
-    span::{HeaplessSpan, ParentContext, parse_traceparent},
+    shared,
+    span::{ParentContext, SpanLink, SpanRecord, parse_traceparent, random_span_id},
 };
 
 /// Whether statements run by this backend are traced.
@@ -179,18 +181,33 @@ fn collect_spans_unguarded(query_desc: *mut pg_sys::QueryDesc) {
         TraceDecision::Skip => return,
         TraceDecision::Trace(parent) => parent,
     };
-    // Builds (and sanitizes) the query text. This can call into Postgres, so it
-    // must happen before any span is published under the DEQUE lock.
-    let Some(span) =
-        HeaplessSpan::from_query(query_desc, wall_start, &parent, get_query_text_mode())
-    else {
+    // Everything below builds the spans of the statement in local memory. It
+    // can call into Postgres (relation names, query text sanitizing), which is
+    // only allowed while no lock is held; the queue lock is taken once, at the
+    // very end, by `publish_spans`.
+    let query_span_id = random_span_id();
+    let query_link = SpanLink {
+        trace_id: parent.trace_id,
+        span_id: query_span_id,
+        end_time: wall_start + Duration::from_nanos(total_ns as u64),
+    };
+    let mut spans = Vec::new();
+    let mut tables = BTreeSet::new();
+    let planstate = unsafe { (*query_desc).planstate };
+    collect_plan_spans(planstate, wall_start, &query_link, &mut spans, &mut tables);
+
+    let Some(query_span) = SpanRecord::from_query(
+        query_desc,
+        wall_start,
+        &parent,
+        get_query_text_mode(),
+        query_span_id,
+        &tables,
+    ) else {
         return;
     };
-
-    let planstate = unsafe { (*query_desc).planstate };
-    collect_plan_spans(planstate, wall_start, &span);
-    publish_span(span);
-    pg_otel_wake_worker();
+    spans.push(query_span);
+    publish_spans(spans);
 }
 
 /// `-1` disables tracing, `0` traces every statement.
@@ -198,66 +215,50 @@ fn meets_slow_query_threshold(duration_ns: i64, min_duration_ms: i32) -> bool {
     min_duration_ms >= 0 && duration_ns >= i64::from(min_duration_ms) * 1_000_000
 }
 
-/// Pushes a finished span onto the shared queue.
+/// Hands all spans of one statement to the exporter worker, or drops them all
+/// (counting them) when the queue is full.
 ///
-/// Never call Postgres code while holding the DEQUE guard: if that code
-/// raised an ERROR that we catch, the LWLock would leak (pgrx only releases it
-/// on unwind when InterruptHoldoffCount is non-zero), and every later enqueue
-/// would hang. Build the span first, lock only to push it.
-fn publish_span(span: HeaplessSpan) {
-    let Some(span) = capture::divert(span) else {
+/// Encoding happens first, without any lock; the queue lock is then held only
+/// for a single memory copy. Never call Postgres code while holding that lock:
+/// if the code raised an ERROR that we catch, the LWLock would leak (pgrx and
+/// [`shared`] only release it on unwind when InterruptHoldoffCount is
+/// non-zero), and every later publish would hang.
+fn publish_spans(spans: Vec<SpanRecord>) {
+    let Some(spans) = capture::divert(spans) else {
         return;
     };
-    let _ = DEQUE.exclusive().enqueue(span);
+    let (batch, skipped) = encode_batch(&spans);
+    shared::publish(&batch, skipped);
 }
 
+/// Appends the span of `planstate` and of its children (children first) to
+/// `spans`, and adds every relation scanned to `tables`.
+///
+/// A node without usable instrumentation is skipped together with its subtree.
 pub fn collect_plan_spans(
     planstate: *mut pg_sys::PlanState,
     wall_start: SystemTime,
-    parent: &HeaplessSpan,
+    parent: &SpanLink,
+    spans: &mut Vec<SpanRecord>,
+    tables: &mut BTreeSet<String>,
 ) {
-    let Some(span) = HeaplessSpan::from_plan(planstate, wall_start, parent) else {
+    let Some(span) = SpanRecord::from_plan(planstate, wall_start, parent) else {
         return;
     };
+    if let Some(relation) = span.relation() {
+        tables.insert(relation.to_owned());
+    }
+    let link = span.link();
 
     let lefttree = unsafe { (*planstate).lefttree };
     let righttree = unsafe { (*planstate).righttree };
     if !lefttree.is_null() {
-        collect_plan_spans(lefttree, wall_start, &span);
+        collect_plan_spans(lefttree, wall_start, &link, spans, tables);
     }
     if !righttree.is_null() {
-        collect_plan_spans(righttree, wall_start, &span);
+        collect_plan_spans(righttree, wall_start, &link, spans, tables);
     }
-    publish_span(span);
-}
-
-pub fn collect_table_names(state: *const pg_sys::PlanState) -> Vec<String> {
-    if state.is_null() {
-        return Vec::new();
-    }
-
-    let mut tables = Vec::new();
-    let left_tree = unsafe { (*state).lefttree };
-    for table in collect_table_names(left_tree) {
-        push_unique(&mut tables, table);
-    }
-
-    let right_tree = unsafe { (*state).righttree };
-    for table in collect_table_names(right_tree) {
-        push_unique(&mut tables, table);
-    }
-
-    if let Some(table) = plan_table_name(state) {
-        push_unique(&mut tables, table);
-    }
-
-    tables
-}
-
-fn push_unique(values: &mut Vec<String>, value: String) {
-    if !values.iter().any(|existing| existing == &value) {
-        values.push(value);
-    }
+    spans.push(span);
 }
 
 pub fn plan_table_name(state: *const pg_sys::PlanState) -> Option<String> {
@@ -321,16 +322,6 @@ pub fn pg_str<'a>(s: *const i8) -> Option<Cow<'a, str>> {
     // SAFETY: non-null; Postgres strings are NUL-terminated and outlive the hook.
     let cstr = unsafe { CStr::from_ptr(s) };
     Some(cstr.to_string_lossy())
-}
-
-/// Wake the worker after work has been added to the shared queue.
-pub fn pg_otel_wake_worker() -> bool {
-    let pid = WORKER_PID.get().load(Ordering::Relaxed);
-    if pid == 0 {
-        return false;
-    }
-
-    unsafe { libc::kill(pid, libc::SIGINT) == 0 }
 }
 
 /// What to do with a statement once its parent trace is known.
@@ -504,10 +495,10 @@ fn percent_decode(text: &str) -> String {
 pub mod capture {
     use std::cell::RefCell;
 
-    use crate::span::HeaplessSpan;
+    use crate::span::SpanRecord;
 
     thread_local! {
-        static CAPTURED: RefCell<Option<Vec<HeaplessSpan>>> = const { RefCell::new(None) };
+        static CAPTURED: RefCell<Option<Vec<SpanRecord>>> = const { RefCell::new(None) };
     }
 
     /// Starts diverting published spans (instead of queueing them).
@@ -516,29 +507,29 @@ pub mod capture {
     }
 
     /// Stops diverting and returns the spans captured since [`start`].
-    pub fn finish() -> Vec<HeaplessSpan> {
+    pub fn finish() -> Vec<SpanRecord> {
         CAPTURED.with(|captured| captured.borrow_mut().take().unwrap_or_default())
     }
 
-    /// Returns the span back when nothing is capturing.
-    pub(super) fn divert(span: HeaplessSpan) -> Option<HeaplessSpan> {
+    /// Returns the batch back when nothing is capturing.
+    pub(super) fn divert(batch: Vec<SpanRecord>) -> Option<Vec<SpanRecord>> {
         CAPTURED.with(|captured| match captured.borrow_mut().as_mut() {
             Some(spans) => {
-                spans.push(span);
+                spans.extend(batch);
                 None
             }
-            None => Some(span),
+            None => Some(batch),
         })
     }
 }
 
 #[cfg(not(any(test, feature = "pg_test")))]
 mod capture {
-    use crate::span::HeaplessSpan;
+    use crate::span::SpanRecord;
 
     #[inline(always)]
-    pub(super) fn divert(span: HeaplessSpan) -> Option<HeaplessSpan> {
-        Some(span)
+    pub(super) fn divert(batch: Vec<SpanRecord>) -> Option<Vec<SpanRecord>> {
+        Some(batch)
     }
 }
 
@@ -925,7 +916,9 @@ mod tests {
     }
 
     fn query_span(spans: &[SpanData]) -> &SpanData {
-        let mut roots = spans.iter().filter(|s| attr(s, "db.operation").is_some());
+        let mut roots = spans
+            .iter()
+            .filter(|s| attr(s, "db.operation.name").is_some());
         let root = roots.next().expect("a query span");
         assert!(roots.next().is_none(), "exactly one query span expected");
         root
@@ -962,11 +955,12 @@ mod tests {
     }
 
     #[pg_test]
-    fn query_text_is_limited_to_the_queue_capacity() {
+    fn query_text_is_longer_than_before_but_still_bounded() {
         Spi::run("SET pg_otel.query_text = 'raw'").unwrap();
-        let long = "x".repeat(2_000);
+        let long = "x".repeat(10_000);
         let spans = traced_spans(&format!("SELECT '{long}'"));
         let text = query_text(query_span(&spans)).expect("query text");
+        assert_eq!(text.len(), crate::span::QUERY_TEXT_MAX_LEN);
         assert!(
             text.len() <= crate::span::QUERY_TEXT_MAX_LEN,
             "{}",
@@ -1023,6 +1017,121 @@ mod tests {
         assert_eq!(scan.parent_span_id, query.span_context.span_id());
         assert_eq!(scan.start_time, query.start_time);
         assert!(scan.end_time <= query.end_time);
+    }
+
+    #[pg_test]
+    fn plan_node_reports_only_its_own_relation() {
+        Spi::run("CREATE TEMP TABLE otel_a AS SELECT 1 AS i").unwrap();
+        Spi::run("CREATE TEMP TABLE otel_b AS SELECT 1 AS i").unwrap();
+        let spans = traced_spans("SELECT * FROM otel_a a JOIN otel_b b USING (i)");
+        let mut relations: Vec<String> = spans
+            .iter()
+            .filter_map(|s| attr(s, "postgresql.plan.relation"))
+            .map(|v| v.as_str().into_owned())
+            .collect();
+        relations.sort();
+        assert_eq!(relations, ["pg_temp.otel_a", "pg_temp.otel_b"]);
+        // Nodes that do not scan a relation carry none (no subtree lists).
+        let joins = spans
+            .iter()
+            .filter(|s| {
+                attr(s, "postgresql.plan.node_type")
+                    .is_some_and(|v| v.as_str().ends_with("JoinState"))
+            })
+            .collect::<Vec<_>>();
+        assert!(!joins.is_empty());
+        assert!(
+            joins
+                .iter()
+                .all(|s| attr(s, "postgresql.plan.relation").is_none())
+        );
+        // The query span still names every relation, computed once for the plan.
+        assert_eq!(
+            query_span(&spans).name,
+            "SELECT pg_temp.otel_a, pg_temp.otel_b"
+        );
+    }
+
+    // Note: this test empties the shared queue first, which discards spans that
+    // concurrently running tests (or the worker's own backlog) queued; no other
+    // test relies on queued spans reaching the worker.
+    #[pg_test]
+    fn span_round_trips_through_the_real_shared_memory_ring() {
+        use crate::{codec, queue, shared};
+
+        Spi::run("SET pg_otel.min_duration_ms = 0").unwrap();
+        Spi::run("CREATE TEMP TABLE otel_ring AS SELECT generate_series(1, 3) AS i").unwrap();
+        capture::start();
+        Spi::run("SELECT * FROM otel_ring").unwrap();
+        let spans = capture::finish();
+        assert!(spans.len() >= 2);
+
+        // Push and drain within one critical section: the background worker
+        // (which drains the same queue) cannot interleave, so this is
+        // deterministic. No Postgres calls inside the closure.
+        let (batch, skipped) = codec::encode_batch(&spans);
+        assert_eq!(skipped, 0);
+        let mut drained = Vec::new();
+        let records = shared::with_ring(|ring| {
+            // Whatever the worker has not drained yet is not ours; set it
+            // aside by draining first.
+            let mut foreign = Vec::new();
+            ring.drain_into(&mut foreign, usize::MAX).unwrap();
+            ring.push_batch(&batch).expect("a fresh ring has room");
+            ring.drain_into(&mut drained, usize::MAX).unwrap()
+        })
+        .expect("shared memory is set up");
+        assert_eq!(records, spans.len());
+
+        let (decoded, undecodable) = codec::decode_records(&drained);
+        assert_eq!(undecodable, 0);
+        assert_eq!(decoded, spans);
+        assert!(queue::records(&drained).all(|r| r.is_ok()));
+    }
+
+    #[pg_test]
+    fn full_queue_drops_the_whole_batch_and_counts_it() {
+        use crate::{queue::Batch, shared};
+
+        let before = shared::dropped_spans();
+        // Far larger than any allowed queue (the maximum is 1 GiB, the default
+        // 1 MiB), so this fails regardless of what is queued. Build it from
+        // maximum-size records to stay within the per-record limit.
+        let mut batch = Batch::new();
+        let record_len = crate::queue::MAX_RECORD_BYTES;
+        let queue_bytes = shared::with_ring(|ring| ring.capacity()).unwrap();
+        while batch.len_bytes() <= queue_bytes {
+            batch
+                .push_record(|out| out.resize(out.len() + record_len, 0))
+                .unwrap();
+        }
+        let count = batch.records();
+        assert_eq!(shared::publish(&batch, 2), shared::Published::Dropped);
+        // Other tests share the counter; it can only have grown further.
+        assert!(shared::dropped_spans() >= before + count as u64 + 2);
+    }
+
+    #[pg_test]
+    fn dropped_spans_are_visible_in_sql() {
+        // The counter is shared with concurrently running tests, so bracket the
+        // SQL reading between two snapshots instead of expecting equality.
+        let before = crate::shared::dropped_spans();
+        let from_sql = Spi::get_one::<i64>("SELECT pg_otel_dropped_spans()")
+            .unwrap()
+            .unwrap() as u64;
+        let after = crate::shared::dropped_spans();
+        assert!(
+            (before..=after).contains(&from_sql),
+            "{before} <= {from_sql} <= {after}"
+        );
+    }
+
+    #[pg_test]
+    fn real_queries_reach_the_queue_without_errors() {
+        Spi::run("SET pg_otel.min_duration_ms = 0").unwrap();
+        for _ in 0..20 {
+            assert_eq!(query_value("SELECT 1"), Some(1));
+        }
     }
 
     #[pg_test]

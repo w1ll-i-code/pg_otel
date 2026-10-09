@@ -1,33 +1,32 @@
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::Duration;
 
 use pgrx::{
-    AssertPGRXSharedMemory, PgAtomic, PgLwLock,
     bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags},
-    pg_shmem_init,
     prelude::*,
 };
 
 use crate::{
     config::ExporterConfig,
     postgres::{collect_spans, request_instrumentation},
-    span::HeaplessSpan,
     worker::background_worker_run,
 };
 
+mod codec;
 mod config;
 mod postgres;
+mod queue;
 mod sanitize;
+mod shared;
 mod span;
 mod worker;
 
 ::pgrx::pg_module_magic!(name, version);
 
-static DEQUE: PgLwLock<AssertPGRXSharedMemory<heapless::spsc::Queue<HeaplessSpan, 1024>>> =
-    unsafe { PgLwLock::new(c"pg_otel_worker_deque") };
+/// Name of the exporter background worker as shown in `pg_stat_activity`.
+const WORKER_NAME: &str = "pg_otel exporter";
 
-// The PID is published by the worker after it starts. A zero value means that
-// the worker has not started (or has already exited).
-static WORKER_PID: PgAtomic<AtomicI32> = unsafe { PgAtomic::new(c"pg_otel_worker_pid") };
+/// Postgres restarts the worker this long after it crashed or exited.
+const WORKER_RESTART_TIME: Duration = Duration::from_secs(10);
 
 // This is a global variable accross all plugins. We store the previous hook so we can execute it before our
 // own hook. This is important because we want to make sure that the previous hook is executed before our own
@@ -44,12 +43,12 @@ pub extern "C-unwind" fn _PG_init() {
     ExporterConfig::define_gucs();
     reserve_guc_prefix();
 
-    pg_shmem_init!(DEQUE = unsafe { AssertPGRXSharedMemory::new(Default::default()) });
-    pg_shmem_init!(WORKER_PID);
+    shared::install_hooks();
 
-    BackgroundWorkerBuilder::new("Background Worker Example")
+    BackgroundWorkerBuilder::new(WORKER_NAME)
         .set_function("background_worker_main")
         .set_library("pg_otel")
+        .set_restart_time(Some(WORKER_RESTART_TIME))
         .load();
 
     // SAFETY: This is called once by postgres
@@ -78,26 +77,33 @@ fn reserve_guc_prefix() {
 #[pg_guard]
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn background_worker_main(_arg: pg_sys::Datum) {
-    // Publish the PID from inside the worker process. MyProcPid is the PID that
-    // another backend must signal to wake this worker.
-    WORKER_PID
-        .get()
-        .swap(unsafe { pg_sys::MyProcPid }, Ordering::Relaxed);
+    // These are the signals we want to receive. Without the SIGTERM handler we
+    // would never be able to exit via an external notification. Backends wake
+    // the worker through its latch, not with signals.
+    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
 
-    // these are the signals we want to receive.  If we don't attach the SIGTERM handler, then
-    // we'll never be able to exit via an external notification
-    BackgroundWorker::attach_signal_handlers(
-        SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM | SignalWakeFlags::SIGINT,
-    );
+    // Publish this process so backends can set its latch; the registration is
+    // removed again when the process exits, whatever the reason.
+    shared::register_worker();
 
     background_worker_run();
 
-    WORKER_PID.get().store(0, Ordering::Relaxed);
+    log!("{} is shutting down", BackgroundWorker::get_name());
 
-    log!(
-        "Goodbye from inside the {} BGWorker! ",
-        BackgroundWorker::get_name()
-    );
+    // Exit with a non-zero status: the postmaster then restarts the worker
+    // after `WORKER_RESTART_TIME` (a zero status would mean "do not restart",
+    // so `pg_terminate_backend()` on the worker would silently end exporting
+    // until the next server start). During a server shutdown the postmaster
+    // does not restart workers; it only logs the exit code. `proc_exit` runs
+    // the exit callbacks that unregister the worker.
+    // SAFETY: called from the worker's main function at the end of its life.
+    unsafe { pg_sys::proc_exit(1) };
+}
+
+/// Number of spans dropped since server start because the span queue was full.
+#[pg_extern]
+fn pg_otel_dropped_spans() -> i64 {
+    i64::try_from(shared::dropped_spans()).unwrap_or(i64::MAX)
 }
 
 #[pg_guard]
