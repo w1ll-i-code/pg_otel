@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::BTreeSet,
+    collections::{BTreeSet, HashSet},
     ffi::CStr,
     panic::AssertUnwindSafe,
     sync::atomic::{AtomicBool, Ordering},
@@ -19,9 +19,12 @@ use pgrx::{
 
 use crate::{
     codec::encode_batch,
-    config::{get_min_duration_ms, get_otlp_traceparent, get_query_text_mode},
+    config::{get_max_plan_spans, get_min_duration_ms, get_otlp_traceparent, get_query_text_mode},
     shared,
-    span::{ParentContext, SpanLink, SpanRecord, parse_traceparent, random_span_id},
+    span::{
+        ChildEdge, ParentContext, PlanChild, Relationship, SpanLink, SpanRecord, parse_traceparent,
+        random_span_id, walk_plan,
+    },
 };
 
 /// Whether statements run by this backend are traced.
@@ -191,10 +194,12 @@ fn collect_spans_unguarded(query_desc: *mut pg_sys::QueryDesc) {
         span_id: query_span_id,
         end_time: wall_start + Duration::from_nanos(total_ns as u64),
     };
-    let mut spans = Vec::new();
-    let mut tables = BTreeSet::new();
     let planstate = unsafe { (*query_desc).planstate };
-    collect_plan_spans(planstate, wall_start, &query_link, &mut spans, &mut tables);
+    let PlanSpans {
+        mut spans,
+        tables,
+        omitted,
+    } = collect_plan_spans(planstate, wall_start, &query_link, get_max_plan_spans());
 
     let Some(query_span) = SpanRecord::from_query(
         query_desc,
@@ -203,6 +208,7 @@ fn collect_spans_unguarded(query_desc: *mut pg_sys::QueryDesc) {
         get_query_text_mode(),
         query_span_id,
         &tables,
+        omitted,
     ) else {
         return;
     };
@@ -231,34 +237,229 @@ fn publish_spans(spans: Vec<SpanRecord>) {
     shared::publish(&batch, skipped);
 }
 
-/// Appends the span of `planstate` and of its children (children first) to
-/// `spans`, and adds every relation scanned to `tables`.
-///
-/// A node without usable instrumentation is skipped together with its subtree.
-pub fn collect_plan_spans(
+/// The spans of a plan tree.
+struct PlanSpans {
+    /// Parents come before their children.
+    spans: Vec<SpanRecord>,
+    /// Relations scanned by the nodes that got a span.
+    tables: BTreeSet<String>,
+    /// Plan nodes without a span because `max_spans` was reached.
+    omitted: usize,
+}
+
+/// Builds a span for every node of the plan tree below `planstate`, like
+/// EXPLAIN walks it (see [`plan_state_children`]), but at most `max_spans`.
+/// Nodes beyond the limit are counted, not exported; being depth-first, the
+/// walk drops the last subtrees and keeps the top of the plan connected.
+fn collect_plan_spans(
     planstate: *mut pg_sys::PlanState,
     wall_start: SystemTime,
-    parent: &SpanLink,
-    spans: &mut Vec<SpanRecord>,
-    tables: &mut BTreeSet<String>,
-) {
-    let Some(span) = SpanRecord::from_plan(planstate, wall_start, parent) else {
-        return;
+    query: &SpanLink,
+    max_spans: usize,
+) -> PlanSpans {
+    let mut result = PlanSpans {
+        spans: Vec::new(),
+        tables: BTreeSet::new(),
+        omitted: 0,
     };
-    if let Some(relation) = span.relation() {
-        tables.insert(relation.to_owned());
+    if planstate.is_null() {
+        return result;
     }
-    let link = span.link();
 
-    let lefttree = unsafe { (*planstate).lefttree };
-    let righttree = unsafe { (*planstate).righttree };
-    if !lefttree.is_null() {
-        collect_plan_spans(lefttree, wall_start, &link, spans, tables);
+    // EXPLAIN prints a physical sub-plan once even if several SubPlan nodes
+    // reference it; the set is global to the walk, like `printed_subplans`.
+    let mut printed_subplans = HashSet::new();
+    let summary = walk_plan(
+        planstate,
+        max_spans,
+        // SAFETY: nodes come from the executor tree of the finished statement.
+        |&node| unsafe { plan_state_children(node, &mut printed_subplans) },
+        |&node, edge, parent| {
+            let span = SpanRecord::from_plan(node, wall_start, &parent.unwrap_or(*query), edge)?;
+            if let Some(relation) = span.relation() {
+                result.tables.insert(relation.to_owned());
+            }
+            let link = span.link();
+            result.spans.push(span);
+            Some(link)
+        },
+    );
+    result.omitted = summary.omitted;
+    result
+}
+
+/// The child plan states of `node`, in the order and with the relationships
+/// EXPLAIN shows them (`ExplainNode`, and `planstate_tree_walker` for which
+/// children exist): initPlans, outer, inner, the members of Append /
+/// MergeAppend / BitmapAnd / BitmapOr (only the live ones after run-time
+/// pruning), the sub-select of a SubqueryScan, the children of a CustomScan,
+/// then subPlans. ModifyTable needs no special case: its input is the outer
+/// plan.
+///
+/// Sub-plans already reported through another node are skipped
+/// (`printed_subplans`, keyed by `plan_id`).
+///
+/// # Safety
+///
+/// `node` must be a valid, initialised plan state.
+unsafe fn plan_state_children(
+    node: *mut pg_sys::PlanState,
+    printed_subplans: &mut HashSet<i32>,
+) -> Vec<PlanChild<*mut pg_sys::PlanState>> {
+    let mut children = Vec::new();
+    // SAFETY: valid per the function contract; the tag of the plan says which
+    // concrete state type `node` is embedded in, as in Postgres' own walker.
+    unsafe {
+        let state = &*node;
+        push_subplans(
+            &mut children,
+            state.initPlan,
+            Relationship::InitPlan,
+            printed_subplans,
+        );
+        push_child(&mut children, state.lefttree, Relationship::Outer);
+        push_child(&mut children, state.righttree, Relationship::Inner);
+
+        if let Some(plan) = state.plan.as_ref() {
+            match plan.type_ {
+                pg_sys::NodeTag::T_Append => {
+                    let append = &*node.cast::<pg_sys::AppendState>();
+                    push_members(&mut children, append.appendplans, append.as_nplans);
+                }
+                pg_sys::NodeTag::T_MergeAppend => {
+                    let merge = &*node.cast::<pg_sys::MergeAppendState>();
+                    push_members(&mut children, merge.mergeplans, merge.ms_nplans);
+                }
+                pg_sys::NodeTag::T_BitmapAnd => {
+                    let bitmap = &*node.cast::<pg_sys::BitmapAndState>();
+                    push_members(&mut children, bitmap.bitmapplans, bitmap.nplans);
+                }
+                pg_sys::NodeTag::T_BitmapOr => {
+                    let bitmap = &*node.cast::<pg_sys::BitmapOrState>();
+                    push_members(&mut children, bitmap.bitmapplans, bitmap.nplans);
+                }
+                pg_sys::NodeTag::T_SubqueryScan => {
+                    let scan = &*node.cast::<pg_sys::SubqueryScanState>();
+                    push_child(&mut children, scan.subplan, Relationship::Subquery);
+                }
+                pg_sys::NodeTag::T_CustomScan => {
+                    let custom = &*node.cast::<pg_sys::CustomScanState>();
+                    for child in list_pointers::<pg_sys::PlanState>(custom.custom_ps) {
+                        push_child(&mut children, child, Relationship::Child);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        push_subplans(
+            &mut children,
+            state.subPlan,
+            Relationship::SubPlan,
+            printed_subplans,
+        );
     }
-    if !righttree.is_null() {
-        collect_plan_spans(righttree, wall_start, &link, spans, tables);
+    children
+}
+
+fn push_child(
+    children: &mut Vec<PlanChild<*mut pg_sys::PlanState>>,
+    node: *mut pg_sys::PlanState,
+    relationship: Relationship,
+) {
+    if !node.is_null() {
+        children.push(PlanChild {
+            node,
+            edge: ChildEdge::new(relationship),
+        });
     }
-    spans.push(span);
+}
+
+/// # Safety
+///
+/// `members` must point to `count` valid plan state pointers (or be null).
+unsafe fn push_members(
+    children: &mut Vec<PlanChild<*mut pg_sys::PlanState>>,
+    members: *mut *mut pg_sys::PlanState,
+    count: i32,
+) {
+    if members.is_null() {
+        return;
+    }
+    for index in 0..usize::try_from(count).unwrap_or(0) {
+        // SAFETY: `index < count` per the function contract.
+        push_child(
+            children,
+            unsafe { *members.add(index) },
+            Relationship::Member,
+        );
+    }
+}
+
+/// Adds the plan states of a `List` of `SubPlanState`s (initPlan / subPlan).
+///
+/// # Safety
+///
+/// `list` must be null or a valid list of `SubPlanState` pointers.
+unsafe fn push_subplans(
+    children: &mut Vec<PlanChild<*mut pg_sys::PlanState>>,
+    list: *mut pg_sys::List,
+    relationship: Relationship,
+    printed_subplans: &mut HashSet<i32>,
+) {
+    // SAFETY: per the function contract.
+    for subplan_state in unsafe { list_pointers::<pg_sys::SubPlanState>(list) } {
+        let Some(subplan_state) = (unsafe { subplan_state.as_ref() }) else {
+            continue;
+        };
+        // SAFETY: a SubPlanState points to its SubPlan.
+        let Some(subplan) = (unsafe { subplan_state.subplan.as_ref() }) else {
+            continue;
+        };
+        if subplan_state.planstate.is_null() || !printed_subplans.insert(subplan.plan_id) {
+            continue;
+        }
+        let name = subplan_display_name(
+            subplan.subLinkType == pg_sys::SubLinkType::CTE_SUBLINK,
+            subplan.isInitPlan,
+            pg_str(subplan.plan_name).as_deref().unwrap_or_default(),
+        );
+        children.push(PlanChild {
+            node: subplan_state.planstate,
+            edge: ChildEdge {
+                relationship,
+                subplan_name: Some(name),
+            },
+        });
+    }
+}
+
+/// The name EXPLAIN gives a sub-plan: `CTE x`, `InitPlan 1` or `SubPlan 2`.
+fn subplan_display_name(is_cte: bool, is_init_plan: bool, plan_name: &str) -> String {
+    let kind = if is_cte {
+        "CTE"
+    } else if is_init_plan {
+        "InitPlan"
+    } else {
+        "SubPlan"
+    };
+    format!("{kind} {plan_name}")
+}
+
+/// The pointers stored in a `List` of pointers (empty for a null list).
+///
+/// # Safety
+///
+/// `list` must be null or a valid `List` holding `*mut T` pointers.
+unsafe fn list_pointers<T>(list: *mut pg_sys::List) -> Vec<*mut T> {
+    // SAFETY: per the function contract.
+    let Some(list) = (unsafe { list.as_ref() }) else {
+        return Vec::new();
+    };
+    (0..usize::try_from(list.length).unwrap_or(0))
+        // SAFETY: `elements` has `length` valid cells for a non-empty list.
+        .map(|index| unsafe { (*list.elements.add(index)).ptr_value.cast::<T>() })
+        .collect()
 }
 
 pub fn plan_table_name(state: *const pg_sys::PlanState) -> Option<String> {
@@ -854,6 +1055,14 @@ mod unit_tests {
     }
 
     #[test]
+    fn subplan_names_follow_explain() {
+        assert_eq!(subplan_display_name(false, true, "1"), "InitPlan 1");
+        assert_eq!(subplan_display_name(false, false, "2"), "SubPlan 2");
+        assert_eq!(subplan_display_name(true, true, "c"), "CTE c");
+        assert_eq!(subplan_display_name(true, false, "c"), "CTE c");
+    }
+
+    #[test]
     fn explain_only_flag_is_detected() {
         assert!(is_explain_only(pg_sys::EXEC_FLAG_EXPLAIN_ONLY as i32));
         assert!(is_explain_only(
@@ -1132,6 +1341,306 @@ mod tests {
         for _ in 0..20 {
             assert_eq!(query_value("SELECT 1"), Some(1));
         }
+    }
+
+    fn node_type(span: &SpanData) -> Option<String> {
+        attr(span, "postgresql.plan.node_type").map(|v| v.as_str().into_owned())
+    }
+
+    fn text_attr(span: &SpanData, key: &str) -> Option<String> {
+        attr(span, key).map(|v| v.as_str().into_owned())
+    }
+
+    fn plan_nodes(spans: &[SpanData]) -> Vec<&SpanData> {
+        spans.iter().filter(|s| node_type(s).is_some()).collect()
+    }
+
+    fn nodes_of_type<'a>(spans: &'a [SpanData], node_type_name: &str) -> Vec<&'a SpanData> {
+        spans
+            .iter()
+            .filter(|s| node_type(s).as_deref() == Some(node_type_name))
+            .collect()
+    }
+
+    fn children_of<'a>(spans: &'a [SpanData], parent: &SpanData) -> Vec<&'a SpanData> {
+        spans
+            .iter()
+            .filter(|s| s.parent_span_id == parent.span_context.span_id())
+            .collect()
+    }
+
+    fn members_of<'a>(spans: &'a [SpanData], parent: &SpanData) -> Vec<&'a SpanData> {
+        children_of(spans, parent)
+            .into_iter()
+            .filter(|s| {
+                text_attr(s, "postgresql.plan.parent_relationship").as_deref() == Some("Member")
+            })
+            .collect()
+    }
+
+    fn relations(spans: &[&SpanData]) -> Vec<String> {
+        let mut relations: Vec<String> = spans
+            .iter()
+            .filter_map(|s| text_attr(s, "postgresql.plan.relation"))
+            .collect();
+        relations.sort();
+        relations
+    }
+
+    fn create_partitions() {
+        Spi::run("CREATE TEMP TABLE otel_p (k int) PARTITION BY RANGE (k)").unwrap();
+        Spi::run("CREATE TEMP TABLE otel_p1 PARTITION OF otel_p FOR VALUES FROM (0) TO (10)")
+            .unwrap();
+        Spi::run("CREATE TEMP TABLE otel_p2 PARTITION OF otel_p FOR VALUES FROM (10) TO (20)")
+            .unwrap();
+        Spi::run("CREATE TEMP TABLE otel_p3 PARTITION OF otel_p FOR VALUES FROM (20) TO (30)")
+            .unwrap();
+        Spi::run("INSERT INTO otel_p SELECT g FROM generate_series(0, 29) g").unwrap();
+    }
+
+    fn create_pair() {
+        Spi::run("CREATE TEMP TABLE otel_a AS SELECT 1 AS i").unwrap();
+        Spi::run("CREATE TEMP TABLE otel_b AS SELECT 1 AS i").unwrap();
+    }
+
+    #[pg_test]
+    fn append_reports_every_partition_as_a_member() {
+        create_partitions();
+        let spans = traced_spans("SELECT * FROM otel_p");
+        let appends = nodes_of_type(&spans, "T_AppendState");
+        assert_eq!(appends.len(), 1);
+        let members = members_of(&spans, appends[0]);
+        assert_eq!(
+            relations(&members),
+            ["pg_temp.otel_p1", "pg_temp.otel_p2", "pg_temp.otel_p3"]
+        );
+        // Nothing was pruned.
+        assert!(attr(appends[0], "postgresql.plan.subplans_removed").is_none());
+        // The member scans are not attached to the query span directly.
+        assert!(
+            members
+                .iter()
+                .all(|m| m.parent_span_id == appends[0].span_context.span_id())
+        );
+    }
+
+    #[pg_test]
+    fn runtime_pruning_reports_only_live_members_and_the_removed_count() {
+        create_partitions();
+        Spi::run("PREPARE otel_q(int) AS SELECT * FROM otel_p WHERE k = $1").unwrap();
+        Spi::run("SET plan_cache_mode = force_generic_plan").unwrap();
+        let spans = traced_spans("EXECUTE otel_q(5)");
+        let appends = nodes_of_type(&spans, "T_AppendState");
+        assert_eq!(
+            appends.len(),
+            1,
+            "{:?}",
+            plan_nodes(&spans)
+                .iter()
+                .map(|s| &s.name)
+                .collect::<Vec<_>>()
+        );
+        let members = members_of(&spans, appends[0]);
+        assert_eq!(relations(&members), ["pg_temp.otel_p1"]);
+        assert_eq!(number(appends[0], "postgresql.plan.subplans_removed"), 2.0);
+    }
+
+    #[pg_test]
+    fn union_all_members_are_children_of_the_append() {
+        create_pair();
+        let spans = traced_spans("SELECT i FROM otel_a UNION ALL SELECT i FROM otel_b");
+        let appends = nodes_of_type(&spans, "T_AppendState");
+        assert_eq!(appends.len(), 1);
+        assert_eq!(
+            relations(&members_of(&spans, appends[0])),
+            ["pg_temp.otel_a", "pg_temp.otel_b"]
+        );
+    }
+
+    #[pg_test]
+    fn bitmap_or_members_are_the_index_scans() {
+        Spi::run(
+            "CREATE TEMP TABLE otel_bm AS SELECT g AS a, g AS b FROM generate_series(1, 10000) g",
+        )
+        .unwrap();
+        Spi::run("CREATE INDEX otel_bm_a ON otel_bm (a)").unwrap();
+        Spi::run("CREATE INDEX otel_bm_b ON otel_bm (b)").unwrap();
+        Spi::run("ANALYZE otel_bm").unwrap();
+        Spi::run("SET enable_seqscan = off").unwrap();
+        Spi::run("SET enable_indexscan = off").unwrap();
+        let spans = traced_spans("SELECT * FROM otel_bm WHERE a = 1 OR b = 2");
+        let ors = nodes_of_type(&spans, "T_BitmapOrState");
+        assert_eq!(ors.len(), 1);
+        let members = members_of(&spans, ors[0]);
+        assert_eq!(members.len(), 2);
+        assert!(
+            members
+                .iter()
+                .all(|m| node_type(m).as_deref() == Some("T_BitmapIndexScanState"))
+        );
+    }
+
+    #[pg_test]
+    fn correlated_subplan_hangs_off_the_node_that_evaluates_it() {
+        create_pair();
+        let spans = traced_spans(
+            "SELECT * FROM otel_a a WHERE a.i = (SELECT max(b.i) FROM otel_b b WHERE b.i = a.i)",
+        );
+        let subplans: Vec<_> = spans
+            .iter()
+            .filter(|s| {
+                text_attr(s, "postgresql.plan.parent_relationship").as_deref() == Some("SubPlan")
+            })
+            .collect();
+        assert_eq!(subplans.len(), 1);
+        let name = text_attr(subplans[0], "postgresql.plan.subplan_name").unwrap();
+        assert!(name.starts_with("SubPlan"), "{name}");
+        assert!(
+            subplans[0].name.starts_with(&format!("{name} → ")),
+            "{}",
+            subplans[0].name
+        );
+        let parent = spans
+            .iter()
+            .find(|s| s.span_context.span_id() == subplans[0].parent_span_id)
+            .expect("the sub-plan's parent has a span");
+        assert_eq!(
+            text_attr(parent, "postgresql.plan.relation").as_deref(),
+            Some("pg_temp.otel_a")
+        );
+    }
+
+    #[pg_test]
+    fn uncorrelated_subquery_is_an_init_plan_of_the_top_node() {
+        create_pair();
+        let spans = traced_spans("SELECT * FROM otel_a WHERE i = (SELECT max(i) FROM otel_b)");
+        let init_plans: Vec<_> = spans
+            .iter()
+            .filter(|s| {
+                text_attr(s, "postgresql.plan.parent_relationship").as_deref() == Some("InitPlan")
+            })
+            .collect();
+        assert_eq!(init_plans.len(), 1);
+        let name = text_attr(init_plans[0], "postgresql.plan.subplan_name").unwrap();
+        assert!(name.starts_with("InitPlan"), "{name}");
+        let query = query_span(&spans);
+        let top = spans
+            .iter()
+            .find(|s| s.span_context.span_id() == init_plans[0].parent_span_id)
+            .expect("the init plan's parent has a span");
+        assert_eq!(top.parent_span_id, query.span_context.span_id());
+    }
+
+    #[pg_test]
+    fn cte_is_reported_as_a_named_sub_plan() {
+        create_pair();
+        let spans = traced_spans("WITH c AS MATERIALIZED (SELECT i FROM otel_a) SELECT * FROM c");
+        let names: Vec<_> = spans
+            .iter()
+            .filter_map(|s| text_attr(s, "postgresql.plan.subplan_name"))
+            .collect();
+        assert_eq!(names, ["CTE c"]);
+        assert_eq!(nodes_of_type(&spans, "T_CteScanState").len(), 1);
+    }
+
+    #[pg_test]
+    fn subquery_scan_child_has_the_subquery_relationship() {
+        create_pair();
+        let spans = traced_spans("SELECT * FROM (SELECT i FROM otel_a OFFSET 0) s WHERE s.i > 0");
+        let scans = nodes_of_type(&spans, "T_SubqueryScanState");
+        assert_eq!(scans.len(), 1);
+        let children = children_of(&spans, scans[0]);
+        assert_eq!(children.len(), 1);
+        assert_eq!(
+            text_attr(children[0], "postgresql.plan.parent_relationship").as_deref(),
+            Some("Subquery")
+        );
+        assert_eq!(
+            text_attr(children[0], "postgresql.plan.relation").as_deref(),
+            Some("pg_temp.otel_a")
+        );
+    }
+
+    #[pg_test]
+    fn never_executed_nodes_are_flagged_with_zero_numbers() {
+        create_pair();
+        let spans = traced_spans("SELECT * FROM otel_a LIMIT 0");
+        let never: Vec<_> = spans
+            .iter()
+            .filter(|s| attr(s, "postgresql.plan.never_executed").is_some())
+            .collect();
+        assert_eq!(
+            never.len(),
+            1,
+            "{:?}",
+            plan_nodes(&spans)
+                .iter()
+                .map(|s| &s.name)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(node_type(never[0]).as_deref(), Some("T_SeqScanState"));
+        assert_eq!(number(never[0], "postgresql.instrumentation.loops"), 0.0);
+        assert_eq!(number(never[0], "postgresql.instrumentation.rows"), 0.0);
+        assert_eq!(number(never[0], "span.duration.us"), 0.0);
+        // Nodes that ran carry no such flag.
+        let executed = nodes_of_type(&spans, "T_LimitState");
+        assert!(attr(executed[0], "postgresql.plan.never_executed").is_none());
+    }
+
+    #[pg_test]
+    fn plan_span_cap_truncates_and_reports_it_on_the_query_span() {
+        create_partitions();
+        Spi::run("SET pg_otel.max_plan_spans = 2").unwrap();
+        let spans = traced_spans("SELECT * FROM otel_p");
+        // Append and three scans: two plan spans are kept, two are omitted.
+        assert_eq!(plan_nodes(&spans).len(), 2);
+        let query = query_span(&spans);
+        assert!(matches!(
+            attr(query, "postgresql.plan.spans_truncated"),
+            Some(Value::Bool(true))
+        ));
+        assert_eq!(number(query, "postgresql.plan.spans_omitted"), 2.0);
+        // The kept part is connected: top node under the query, one member under it.
+        let top = nodes_of_type(&spans, "T_AppendState");
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].parent_span_id, query.span_context.span_id());
+        assert_eq!(members_of(&spans, top[0]).len(), 1);
+
+        Spi::run("SET pg_otel.max_plan_spans = 0").unwrap();
+        let spans = traced_spans("SELECT * FROM otel_p");
+        assert!(plan_nodes(&spans).is_empty());
+        assert_eq!(
+            number(query_span(&spans), "postgresql.plan.spans_omitted"),
+            4.0
+        );
+    }
+
+    #[pg_test]
+    fn complete_plans_carry_no_truncation_marker() {
+        create_partitions();
+        let spans = traced_spans("SELECT * FROM otel_p");
+        assert!(attr(query_span(&spans), "postgresql.plan.spans_truncated").is_none());
+        assert!(attr(query_span(&spans), "postgresql.plan.spans_omitted").is_none());
+    }
+
+    #[pg_test]
+    fn deeply_nested_plans_are_collected() {
+        create_pair();
+        // Explicit join order (no reordering) makes a plan that is 40 joins deep.
+        Spi::run("SET join_collapse_limit = 1").unwrap();
+        let mut sql = String::from("SELECT 1 FROM otel_a t0");
+        for n in 1..40 {
+            sql.push_str(&format!(" JOIN otel_a t{n} ON t{n}.i = t{}.i", n - 1));
+        }
+        let spans = traced_spans(&sql);
+        let scans = nodes_of_type(&spans, "T_SeqScanState").len();
+        assert_eq!(scans, 40);
+        assert!(
+            plan_nodes(&spans).len() >= 79,
+            "{}",
+            plan_nodes(&spans).len()
+        );
+        assert!(attr(query_span(&spans), "postgresql.plan.spans_truncated").is_none());
     }
 
     #[pg_test]

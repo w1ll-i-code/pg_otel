@@ -62,6 +62,7 @@ pg_otel.min_duration_ms = 0 # -1 (default) disables tracing, 0 traces every stat
 | `pg_otel.traceparent` | string | unset | any user, per session/transaction | W3C `traceparent` of the parent span. See [Usage](#usage). |
 | `pg_otel.query_text` | enum | `normalized` | **superuser** (or roles granted `SET` on the parameter) | `off`: no query text. `normalized`: literals are replaced with placeholders (quoted identifiers such as `"My Table"` are kept as is). `raw`: the query text as received (may contain sensitive data). With `normalized`, databases whose encoding is not UTF-8 (for example `SQL_ASCII`) produce no query text, because normalization fails closed. |
 | `pg_otel.min_duration_ms` | int (ms) | `-1` | **superuser** (or roles granted `SET` on the parameter) | Only export spans for statements that run at least this long. `-1` disables tracing, `0` traces every statement. Restricted to superusers so that regular users cannot force tracing of everything. |
+| `pg_otel.max_plan_spans` | int | `1000` | **superuser** (or roles granted `SET` on the parameter) | Most plan node spans exported per statement (0 to 100000; 0 exports only the query span). Plans with more nodes (for example thousands of partitions) are cut off, see [Exported spans](#exported-spans). |
 | `pg_otel.queue_size_kb` | int (kB) | `1024` | server start only | Size of the shared-memory span queue in kilobytes (64 to 1048576). Needs a restart because shared memory is allocated at startup. See [How spans are exported](#how-spans-are-exported). |
 
 All `pg_otel.*` names are reserved: `SET` and `ALTER SYSTEM` reject unknown
@@ -159,7 +160,12 @@ a user suppress tracing of their own statements by supplying such a value.
 ## Exported spans
 
 Each traced statement produces one query span with one child span per plan
-node.
+node. The plan is walked the way `EXPLAIN` shows it: outer and inner children,
+the live members of `Append`, `MergeAppend`, `BitmapAnd` and `BitmapOr`, the
+sub-select of a `SubqueryScan`, the children of a `CustomScan`, and init plans,
+CTEs and sub-plans (a sub-plan used by several nodes is reported once). Each
+span is a child of the plan node it hangs off in the plan tree, so the trace
+has the same shape as the `EXPLAIN` output.
 
 Query span attributes:
 
@@ -176,7 +182,36 @@ Plan node spans carry `db.system.name`, `postgresql.plan.*` (planner estimates
 and `postgresql.plan.relation`, the `schema.table` this node itself scans, if
 any) and `postgresql.instrumentation.*` (actual rows, loops, filtered rows,
 startup and total time in seconds) attributes, plus `span.duration.us` in
-microseconds. The query span's name lists all relations of the plan.
+microseconds. The query span's name lists all relations of the plan nodes that
+have a span.
+
+Attributes that describe how a plan node fits into the plan (present when they
+apply):
+
+| Attribute | Description |
+| --- | --- |
+| `postgresql.plan.parent_relationship` | EXPLAIN's "Parent Relationship": `Outer`, `Inner`, `InitPlan`, `SubPlan`, `Member` (of an Append, MergeAppend, BitmapAnd or BitmapOr), `Subquery` (of a SubqueryScan) or `Child` (of a CustomScan). Absent on the top plan node. |
+| `postgresql.plan.subplan_name` | `InitPlan 1`, `SubPlan 2` or `CTE name` on the root of a sub-plan. The span name is prefixed with it (`InitPlan 1 → postgresql.operation...`). |
+| `postgresql.plan.subplans_removed` | Members of an Append or MergeAppend that run-time partition pruning removed; they have no spans. |
+| `postgresql.plan.workers_launched` | Parallel workers launched by a Gather or GatherMerge. The workers' work is already included in the totals of the nodes below it. |
+| `postgresql.plan.never_executed` | `true` if the node never ran (for example below `LIMIT 0`, or the inner side of a join with an empty outer side). Such a node still gets a span, as EXPLAIN still lists it, with zero duration and counts. |
+| `postgresql.plan.instrumentation_incomplete` | `true` if the node was interrupted while running (for example by a cancel) and its timings and counts could not be read; they are reported as zero. Its children are still reported. |
+
+### Large plans
+
+A statement can have a huge plan, for example a table with thousands of
+partitions. At most `pg_otel.max_plan_spans` plan node spans are exported per
+statement. The plan is walked depth first, parents before children, so the
+nodes that are kept are the first ones in `EXPLAIN` order and form a connected
+tree below the query span; the rest are left out. The query span then has
+`postgresql.plan.spans_truncated = true` and `postgresql.plan.spans_omitted`
+with the number of plan nodes that were left out. Relations that only the
+omitted nodes scan do not appear in the query span's name.
+
+Even with the limit, the spans of one statement have to fit into the span queue
+together, otherwise all of them are dropped (and counted, see above): size
+`pg_otel.queue_size_kb` for at least a few hundred kilobytes if you raise
+`pg_otel.max_plan_spans`.
 
 ### Breaking changes in the exported data
 
@@ -192,14 +227,14 @@ If you have dashboards or alerts on earlier versions of this extension:
 | `span.duration.us` | now really microseconds (it used to be off by a factor of 1000 or 1e6) |
 | span timestamps and durations | converted from Postgres' clock ticks to nanoseconds (they were wrong on machines where the ticks are not nanoseconds) |
 | span names | no longer cut to 64 characters (now 256 bytes) |
+| plans | nodes below `Append`, `MergeAppend`, `BitmapAnd`/`BitmapOr`, `SubqueryScan`, `CustomScan`, and init plans / sub-plans now have spans (they were missing); the number of spans per statement grows accordingly |
 
 Timing notes: Postgres only records accumulated durations, not wall-clock
 timestamps, per plan node. The query span starts at the time the statement began
 executing (derived from the end time and the measured duration) and plan node
 spans all start at that same instant; each ends after its accumulated run time.
 The duration covers executor run and finish, not parsing, planning or executor
-startup. Nodes interrupted mid-execution are skipped. `EXPLAIN` without
-`ANALYZE` is not traced.
+startup. `EXPLAIN` without `ANALYZE` is not traced.
 
 ## Building
 
@@ -212,8 +247,8 @@ Clone the repository and run `cargo build` to build the plugin.
 The span queue has a fixed size (`pg_otel.queue_size_kb`); spans are dropped
 when it is full (see [How spans are exported](#how-spans-are-exported)). Span
 and relation names are truncated to 256 bytes and the query text to 4096 bytes.
-Plan nodes below `Append`/`MergeAppend`, sub-plans and init-plans are not
-reported yet.
+Plans with more than `pg_otel.max_plan_spans` nodes are cut off (see
+[Large plans](#large-plans)).
 
 
 ## Acknowledgements

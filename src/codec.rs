@@ -20,7 +20,7 @@ use crate::{
     span::{PlanNodeAttributes, QueryAttributes, SpanAttributes, SpanRecord},
 };
 
-const FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION: u8 = 2;
 const KIND_QUERY: u8 = 1;
 const KIND_PLAN_NODE: u8 = 2;
 
@@ -72,11 +72,18 @@ fn encode_query(query: &QueryAttributes, out: &mut Vec<u8>) {
     put_opt_str(out, query.query_text.as_deref());
     put_i64(out, query.query_id);
     put_i64(out, query.exec_total_time_ns);
+    put_u64(out, query.plan_spans_omitted);
 }
 
 fn encode_plan_node(node: &PlanNodeAttributes, out: &mut Vec<u8>) {
     put_str(out, &node.node_type);
     put_opt_str(out, node.relation.as_deref());
+    put_opt_str(out, node.parent_relationship.as_deref());
+    put_opt_str(out, node.subplan_name.as_deref());
+    put_u64(out, node.subplans_removed);
+    put_opt_i64(out, node.workers_launched);
+    put_bool(out, node.never_executed);
+    put_bool(out, node.instrumentation_incomplete);
     put_f64(out, node.startup_cost);
     put_f64(out, node.total_cost);
     put_f64(out, node.rows);
@@ -133,6 +140,7 @@ fn decode_query(reader: &mut Reader) -> Result<QueryAttributes, DecodeError> {
         query_text: reader.opt_string()?,
         query_id: reader.i64()?,
         exec_total_time_ns: reader.i64()?,
+        plan_spans_omitted: reader.u64()?,
     })
 }
 
@@ -140,6 +148,12 @@ fn decode_plan_node(reader: &mut Reader) -> Result<PlanNodeAttributes, DecodeErr
     Ok(PlanNodeAttributes {
         node_type: reader.string()?,
         relation: reader.opt_string()?,
+        parent_relationship: reader.opt_string()?,
+        subplan_name: reader.opt_string()?,
+        subplans_removed: reader.u64()?,
+        workers_launched: reader.opt_i64()?,
+        never_executed: reader.bool()?,
+        instrumentation_incomplete: reader.bool()?,
         startup_cost: reader.f64()?,
         total_cost: reader.f64()?,
         rows: reader.f64()?,
@@ -194,6 +208,20 @@ fn put_bool(out: &mut Vec<u8>, value: bool) {
 
 fn put_i64(out: &mut Vec<u8>, value: i64) {
     out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_opt_i64(out: &mut Vec<u8>, value: Option<i64>) {
+    match value {
+        Some(value) => {
+            out.push(1);
+            put_i64(out, value);
+        }
+        None => out.push(0),
+    }
 }
 
 fn put_f64(out: &mut Vec<u8>, value: f64) {
@@ -262,6 +290,18 @@ impl<'a> Reader<'a> {
         Ok(i64::from_le_bytes(self.array()?))
     }
 
+    fn u64(&mut self) -> Result<u64, DecodeError> {
+        Ok(u64::from_le_bytes(self.array()?))
+    }
+
+    fn opt_i64(&mut self) -> Result<Option<i64>, DecodeError> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => self.i64().map(Some),
+            other => Err(DecodeError::UnknownTag(other)),
+        }
+    }
+
     fn f64(&mut self) -> Result<f64, DecodeError> {
         Ok(f64::from_le_bytes(self.array()?))
     }
@@ -303,6 +343,7 @@ mod tests {
                 query_text: Some("SELECT * FROM t WHERE x = $1 -- é€😀".to_owned()),
                 query_id: -42,
                 exec_total_time_ns: 100_000_000,
+                plan_spans_omitted: 17,
             }),
         }
     }
@@ -318,6 +359,12 @@ mod tests {
             attributes: SpanAttributes::PlanNode(PlanNodeAttributes {
                 node_type: "T_SeqScanState".to_owned(),
                 relation: Some("public.t".to_owned()),
+                parent_relationship: Some("Member".to_owned()),
+                subplan_name: Some("InitPlan 1".to_owned()),
+                subplans_removed: 2,
+                workers_launched: Some(3),
+                never_executed: true,
+                instrumentation_incomplete: true,
                 startup_cost: 0.0,
                 total_cost: 35.5,
                 rows: 2550.0,
@@ -364,6 +411,12 @@ mod tests {
         let mut span = plan_span();
         if let SpanAttributes::PlanNode(node) = &mut span.attributes {
             node.relation = None;
+            node.parent_relationship = None;
+            node.subplan_name = None;
+            node.workers_launched = None;
+            node.subplans_removed = 0;
+            node.never_executed = false;
+            node.instrumentation_incomplete = false;
         }
         assert_eq!(decode_span(&encoded(&span)), Ok(span));
     }

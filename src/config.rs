@@ -277,6 +277,28 @@ pub fn get_queue_size_kb() -> i32 {
     QUEUE_SIZE_KB.get()
 }
 
+const MAX_PLAN_SPANS_GUC: &CStr = c"pg_otel.max_plan_spans";
+static MAX_PLAN_SPANS: GucSetting<i32> = GucSetting::<i32>::new(1000);
+
+fn define_max_plan_spans_guc() {
+    GucRegistry::define_int_guc(
+        MAX_PLAN_SPANS_GUC,
+        c"Maximum plan node spans exported per statement",
+        c"Plans with more nodes (for example thousands of partitions) are cut off; the query span reports how many nodes were left out. 0 exports no plan node spans.",
+        &MAX_PLAN_SPANS,
+        0,
+        100_000,
+        // Superuser-only so users cannot make every statement export huge traces.
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+}
+
+/// Returns the maximum number of plan node spans exported per statement.
+pub fn get_max_plan_spans() -> usize {
+    usize::try_from(MAX_PLAN_SPANS.get()).unwrap_or(0)
+}
+
 #[derive(Clone, Debug)]
 pub struct ExporterConfig {
     pub endpoint: String,
@@ -299,6 +321,7 @@ impl ExporterConfig {
         define_query_text_guc();
         define_min_duration_ms_guc();
         define_queue_size_kb_guc();
+        define_max_plan_spans_guc();
     }
 
     pub fn load() -> Option<Self> {
