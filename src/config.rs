@@ -1,6 +1,6 @@
 use std::{ffi::CStr, fmt::Display};
 
-use pgrx::{log, GucContext, GucFlags, GucRegistry, GucSetting};
+use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting, PostgresGucEnum, log};
 
 const OTLP_ENDPOINT_GUC: &CStr = c"pg_otel.otlp_endpoint";
 pub static OTLP_ENDPOINT: GucSetting<Option<std::ffi::CString>> =
@@ -87,14 +87,14 @@ fn define_otlp_authorization_guc() {
         c"The value of the Authorization header sent to the OTLP collector.",
         &OTLP_AUTHORIZATION,
         GucContext::Sighup,
-        GucFlags::default(),
+        // The value is a credential: hide it from SHOW / pg_settings for roles
+        // that are neither superusers nor members of pg_read_all_settings.
+        GucFlags::SUPERUSER_ONLY | GucFlags::NO_SHOW_ALL,
     );
 }
 
 fn get_otlp_authorization() -> Option<String> {
-    let Some(guc_var) = OTLP_AUTHORIZATION.get() else {
-        return None;
-    };
+    let guc_var = OTLP_AUTHORIZATION.get()?;
     match guc_var.into_string() {
         Ok(authorization) => Some(authorization),
         Err(err) => {
@@ -120,13 +120,11 @@ fn define_otlp_ca_certificate_guc() {
 }
 
 fn get_otlp_ca_certificate() -> Option<String> {
-    let Some(guc_var) = OTLP_CA_CERTIFICATE.get() else {
-        return None;
-    };
+    let guc_var = OTLP_CA_CERTIFICATE.get()?;
     match guc_var.into_string() {
         Ok(cert) => Some(cert),
         Err(err) => {
-            log_config_not_valid(OTLP_AUTHORIZATION_GUC, err);
+            log_config_not_valid(OTLP_CA_CERTIFICATE_GUC, err);
             None
         }
     }
@@ -168,7 +166,7 @@ fn get_otlp_service_name() -> String {
     }
 }
 
-const OTLP_TRACEPARENT_GUC: &CStr = c"otel.traceparent";
+const OTLP_TRACEPARENT_GUC: &CStr = c"pg_otel.traceparent";
 static OTLP_TRACEPARENT: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
 
@@ -184,15 +182,97 @@ fn define_otlp_traceparent_guc() {
 }
 
 pub fn get_otlp_traceparent() -> Option<String> {
-    let guc_var = OTLP_SERVICE_NAME.get()?;
+    let guc_var = OTLP_TRACEPARENT.get()?;
 
     match guc_var.into_string() {
-        Ok(name) => Some(name),
+        Ok(traceparent) => Some(traceparent),
         Err(err) => {
-            log_config_not_valid(OTLP_SERVICE_NAME_GUC, err);
+            log_config_not_valid(OTLP_TRACEPARENT_GUC, err);
             None
         }
     }
+}
+
+/// How much of a statement's text is attached to exported spans.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PostgresGucEnum)]
+pub enum QueryTextMode {
+    /// Never export query text.
+    #[name = c"off"]
+    Off,
+    /// Export query text with literals replaced by placeholders.
+    #[name = c"normalized"]
+    Normalized,
+    /// Export the query text exactly as received. May contain sensitive data.
+    #[name = c"raw"]
+    Raw,
+}
+
+const QUERY_TEXT_GUC: &CStr = c"pg_otel.query_text";
+static QUERY_TEXT: GucSetting<QueryTextMode> =
+    GucSetting::<QueryTextMode>::new(QueryTextMode::Normalized);
+
+fn define_query_text_guc() {
+    GucRegistry::define_enum_guc(
+        QUERY_TEXT_GUC,
+        c"Controls query text exported in spans",
+        c"One of off, normalized (literals removed) or raw (query text as received).",
+        &QUERY_TEXT,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+}
+
+/// Returns the configured [`QueryTextMode`].
+#[allow(dead_code)] // wired in later phase
+pub fn get_query_text_mode() -> QueryTextMode {
+    QUERY_TEXT.get()
+}
+
+const MIN_DURATION_MS_GUC: &CStr = c"pg_otel.min_duration_ms";
+static MIN_DURATION_MS: GucSetting<i32> = GucSetting::<i32>::new(-1);
+
+fn define_min_duration_ms_guc() {
+    GucRegistry::define_int_guc(
+        MIN_DURATION_MS_GUC,
+        c"Minimum statement duration in milliseconds to export a span",
+        c"-1 disables exporting, 0 exports every statement.",
+        &MIN_DURATION_MS,
+        -1,
+        i32::MAX,
+        GucContext::Suset,
+        GucFlags::UNIT_MS,
+    );
+}
+
+/// Returns the minimum statement duration (ms) for exporting a span.
+///
+/// `-1` means tracing is disabled and `0` means every statement is traced.
+#[allow(dead_code)] // wired in later phase
+pub fn get_min_duration_ms() -> i32 {
+    MIN_DURATION_MS.get()
+}
+
+const QUEUE_SIZE_KB_GUC: &CStr = c"pg_otel.queue_size_kb";
+static QUEUE_SIZE_KB: GucSetting<i32> = GucSetting::<i32>::new(1024);
+
+fn define_queue_size_kb_guc() {
+    GucRegistry::define_int_guc(
+        QUEUE_SIZE_KB_GUC,
+        c"Size of the shared span queue in kilobytes",
+        c"Memory reserved at server start for spans waiting to be exported.",
+        &QUEUE_SIZE_KB,
+        64,
+        1_048_576,
+        // Shared memory is sized at postmaster start, so this cannot change later.
+        GucContext::Postmaster,
+        GucFlags::UNIT_KB,
+    );
+}
+
+/// Returns the shared span queue size in kilobytes.
+#[allow(dead_code)] // wired in later phase
+pub fn get_queue_size_kb() -> i32 {
+    QUEUE_SIZE_KB.get()
 }
 
 #[derive(Clone, Debug)]
@@ -214,6 +294,9 @@ impl ExporterConfig {
         define_otlp_ca_certificate_guc();
         define_otlp_service_name_guc();
         define_otlp_traceparent_guc();
+        define_query_text_guc();
+        define_min_duration_ms_guc();
+        define_queue_size_kb_guc();
     }
 
     pub fn load() -> Option<Self> {
