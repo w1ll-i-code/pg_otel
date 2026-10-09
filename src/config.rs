@@ -130,7 +130,7 @@ fn get_otlp_ca_certificate() -> Option<String> {
     }
 }
 
-const OTLP_SERVICE_NAME_GUC: &CStr = c"otel.service.name";
+const OTLP_SERVICE_NAME_GUC: &CStr = c"pg_otel.service_name";
 const OTLP_SERVICE_NAME_DEFAULT: &CStr = c"postgresql";
 pub static OTLP_SERVICE_NAME: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(Some(OTLP_SERVICE_NAME_DEFAULT));
@@ -181,6 +181,11 @@ fn define_otlp_traceparent_guc() {
     );
 }
 
+/// Returns the raw value of the user-settable `pg_otel.traceparent` GUC, if set.
+///
+/// The value is not validated here: callers must parse it and treat an invalid
+/// one as absent. Use `SET LOCAL` so it cannot leak into later transactions of
+/// a pooled connection.
 pub fn get_otlp_traceparent() -> Option<String> {
     let guc_var = OTLP_TRACEPARENT.get()?;
 
@@ -247,7 +252,6 @@ fn define_min_duration_ms_guc() {
 /// Returns the minimum statement duration (ms) for exporting a span.
 ///
 /// `-1` means tracing is disabled and `0` means every statement is traced.
-#[allow(dead_code)] // wired in later phase
 pub fn get_min_duration_ms() -> i32 {
     MIN_DURATION_MS.get()
 }

@@ -6,9 +6,9 @@ use std::{
 };
 
 use opentelemetry::{
+    Array, InstrumentationScope, KeyValue, SpanId, StringValue, TraceFlags, TraceId, Value,
     propagation::{Extractor, TextMapPropagator},
     trace::{SpanContext, SpanKind, Status, TraceContextExt, TraceState},
-    Array, InstrumentationScope, KeyValue, SpanId, StringValue, TraceFlags, TraceId, Value,
 };
 use opentelemetry_sdk::{propagation::TraceContextPropagator, trace::SpanData};
 use pgrx::{
@@ -17,6 +17,67 @@ use pgrx::{
 };
 
 use crate::postgres::{collect_table_names, pg_str, plan_table_name};
+
+/// Flags of every exported span. Spans are only collected when the trace is
+/// sampled (a remote parent with the sampled flag cleared suppresses
+/// collection entirely), so everything that reaches the exporter is sampled.
+const EXPORTED_TRACE_FLAGS: TraceFlags = TraceFlags::SAMPLED;
+
+/// Where the root span of a statement attaches to a trace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParentContext {
+    pub trace_id: TraceId,
+    pub span_id: SpanId,
+    /// `true` when the parent was received from outside (traceparent), `false`
+    /// when this statement starts a new trace.
+    pub is_remote: bool,
+}
+
+impl ParentContext {
+    /// A statement without an incoming trace starts a new one: random
+    /// non-zero trace id and no parent span.
+    pub fn new_root() -> Self {
+        Self {
+            trace_id: random_trace_id(),
+            span_id: SpanId::INVALID,
+            is_remote: false,
+        }
+    }
+
+    /// Continues the trace described by `remote`.
+    pub fn from_remote(remote: &SpanContext) -> Self {
+        Self {
+            trace_id: remote.trace_id(),
+            span_id: remote.span_id(),
+            is_remote: true,
+        }
+    }
+}
+
+// Invariant for both generators below: `fastrand`'s thread-local generator is
+// seeded lazily on first use. It must never be used in the postmaster (before
+// fork), otherwise every backend would inherit the same state and produce
+// identical ids. Ids are only generated inside backends (executor hook).
+
+/// Random trace id; the all-zero id is invalid in W3C trace context.
+pub fn random_trace_id() -> TraceId {
+    loop {
+        let id = TraceId::from(fastrand::u128(..));
+        if id != TraceId::INVALID {
+            return id;
+        }
+    }
+}
+
+/// Random span id; the all-zero id is invalid in W3C trace context.
+pub fn random_span_id() -> SpanId {
+    loop {
+        let id = SpanId::from(fastrand::u64(..));
+        if id != SpanId::INVALID {
+            return id;
+        }
+    }
+}
 
 const QUERY_TEXT_MAX_LEN: usize = 512;
 const PLAN_NODE_NAME_MAX_LEN: usize = 64;
@@ -33,6 +94,7 @@ pub struct HeaplessSpan {
 }
 
 pub struct QueryAttributes {
+    parent_is_remote: bool,
     operation: CmdType::Type,
     query_text: heapless::String<QUERY_TEXT_MAX_LEN>,
     exec_startup_time_seconds: f64,
@@ -67,7 +129,7 @@ impl HeaplessSpan {
     pub fn from_query(
         query_desc: *const QueryDesc,
         wall_start: SystemTime,
-        parent_span: &SpanContext,
+        parent: &ParentContext,
     ) -> Option<Self> {
         let query_desc = unsafe { query_desc.as_ref()? };
         let plan_state = unsafe { (*query_desc).planstate.as_ref()? };
@@ -89,13 +151,14 @@ impl HeaplessSpan {
         let exec_total_time_seconds = instrument.total.ticks as f64 / 1e9;
 
         Some(HeaplessSpan {
-            trace_id: parent_span.trace_id(),
-            span_id: SpanId::from(fastrand::u64(..)),
-            parent_id: parent_span.span_id(),
+            trace_id: parent.trace_id,
+            span_id: random_span_id(),
+            parent_id: parent.span_id,
             name: truncate(&name),
             start_time,
             end_time,
             attributes: HeaplessSpanAttributes::Query(QueryAttributes {
+                parent_is_remote: parent.is_remote,
                 operation,
                 query_text: truncate(&query_text),
                 exec_startup_time_seconds,
@@ -138,7 +201,7 @@ impl HeaplessSpan {
 
         Some(HeaplessSpan {
             trace_id: parent.trace_id,
-            span_id: SpanId::from(fastrand::u64(..)),
+            span_id: random_span_id(),
             parent_id: parent.span_id,
             name,
             start_time,
@@ -183,7 +246,7 @@ impl From<HeaplessSpan> for SpanData {
         let span_context = SpanContext::new(
             span.trace_id,
             span.span_id,
-            TraceFlags::SAMPLED,
+            EXPORTED_TRACE_FLAGS,
             false,
             TraceState::default(),
         );
@@ -200,7 +263,7 @@ impl From<HeaplessSpan> for SpanData {
                 SpanData {
                     span_context,
                     parent_span_id: span.parent_id,
-                    parent_span_is_remote: true,
+                    parent_span_is_remote: attr.parent_is_remote,
                     span_kind: SpanKind::Server,
                     name: span.name.as_str().to_owned().into(),
                     start_time: span.start_time,
@@ -337,8 +400,122 @@ impl<'a> Extractor for TraceParentExtractor<'_> {
     }
 }
 
-pub fn parse_traceparent(s: &str) -> SpanContext {
+/// Parses a W3C `traceparent` header value.
+///
+/// Returns `None` unless the value is a valid trace context (well-formed, with
+/// non-zero trace and span ids), so callers can fall back to another source.
+pub fn parse_traceparent(s: &str) -> Option<SpanContext> {
+    // The propagator accepts hex fields of any length, so check the shape first.
+    if !has_traceparent_shape(s.trim()) {
+        return None;
+    }
     let propagator = TraceContextPropagator::default();
     let extractor = TraceParentExtractor::new(s);
-    propagator.extract(&extractor).span().span_context().clone()
+    let context = propagator.extract(&extractor).span().span_context().clone();
+    context.is_valid().then_some(context)
+}
+
+/// `version-traceid-spanid-flags` with fixed-width lowercase hex fields. Version
+/// `00` has no further fields; `ff` is forbidden; future versions may append
+/// fields after the four known ones.
+fn has_traceparent_shape(s: &str) -> bool {
+    fn is_hex(field: &str, len: usize) -> bool {
+        field.len() == len
+            && field
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
+    let parts: Vec<&str> = s.split('-').collect();
+    let [version, trace_id, span_id, flags, ..] = parts[..] else {
+        return false;
+    };
+    is_hex(version, 2)
+        && version != "ff"
+        && (version != "00" || parts.len() == 4)
+        && is_hex(trace_id, 32)
+        && is_hex(span_id, 16)
+        && is_hex(flags, 2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VALID: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+    #[test]
+    fn parses_valid_sampled_traceparent() {
+        let context = parse_traceparent(VALID).expect("valid traceparent");
+        assert!(context.is_sampled());
+        assert_eq!(
+            context.trace_id(),
+            TraceId::from_hex("4bf92f3577b34da6a3ce929d0e0e4736").unwrap()
+        );
+        assert_eq!(
+            context.span_id(),
+            SpanId::from_hex("00f067aa0ba902b7").unwrap()
+        );
+    }
+
+    #[test]
+    fn accepts_surrounding_whitespace_and_future_versions() {
+        assert!(parse_traceparent(&format!("  {VALID}\n")).is_some());
+        assert!(
+            parse_traceparent("01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-more")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn parses_unsampled_flag() {
+        let context =
+            parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00").unwrap();
+        assert!(!context.is_sampled());
+    }
+
+    #[test]
+    fn rejects_invalid_traceparents() {
+        for invalid in [
+            "",
+            "garbage",
+            "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7",
+            "00-4bf92f3577b34da6a3ce929d0e0e47-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba9-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-1",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",
+            "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e473é-00f067aa0ba902b7-01",
+        ] {
+            assert!(parse_traceparent(invalid).is_none(), "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn root_parent_is_new_local_trace() {
+        let root = ParentContext::new_root();
+        assert_ne!(root.trace_id, TraceId::INVALID);
+        assert_eq!(root.span_id, SpanId::INVALID);
+        assert!(!root.is_remote);
+    }
+
+    #[test]
+    fn remote_parent_keeps_ids_and_is_remote() {
+        let remote = parse_traceparent(VALID).unwrap();
+        let parent = ParentContext::from_remote(&remote);
+        assert_eq!(parent.trace_id, remote.trace_id());
+        assert_eq!(parent.span_id, remote.span_id());
+        assert!(parent.is_remote);
+    }
+
+    #[test]
+    fn random_ids_are_never_zero() {
+        for _ in 0..10_000 {
+            assert_ne!(random_span_id(), SpanId::INVALID);
+            assert_ne!(random_trace_id(), TraceId::INVALID);
+        }
+    }
 }

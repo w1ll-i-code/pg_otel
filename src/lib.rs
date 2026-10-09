@@ -42,6 +42,7 @@ pub extern "C-unwind" fn _PG_init() {
         pgrx::error!("this extension must be loaded via shared_preload_libraries.");
     }
     ExporterConfig::define_gucs();
+    reserve_guc_prefix();
 
     pg_shmem_init!(DEQUE = unsafe { AssertPGRXSharedMemory::new(Default::default()) });
     pg_shmem_init!(WORKER_PID);
@@ -57,6 +58,20 @@ pub extern "C-unwind" fn _PG_init() {
         pg_sys::ExecutorStart_hook = Some(my_executor_start_hook);
         PREV_EXECUTOR_END = pg_sys::ExecutorEnd_hook;
         pg_sys::ExecutorEnd_hook = Some(my_executor_end_hook);
+    }
+}
+
+/// Rejects unknown `pg_otel.*` settings (typos in `postgresql.conf`) instead of
+/// silently accepting them as placeholders.
+fn reserve_guc_prefix() {
+    // SAFETY: called from `_PG_init` after all `pg_otel.*` GUCs are defined.
+    #[cfg(not(any(feature = "pg13", feature = "pg14")))]
+    unsafe {
+        pg_sys::MarkGUCPrefixReserved(c"pg_otel".as_ptr());
+    }
+    #[cfg(any(feature = "pg13", feature = "pg14"))]
+    unsafe {
+        pg_sys::EmitWarningsOnPlaceholders(c"pg_otel".as_ptr());
     }
 }
 
@@ -90,6 +105,7 @@ unsafe extern "C-unwind" fn my_executor_start_hook(
     query_desc: *mut pg_sys::QueryDesc,
     eflags: i32,
 ) {
+    // Does nothing when tracing is disabled or in parallel workers.
     request_instrumentation(query_desc);
 
     // SAFETY: I am trusting the docs on this one.
@@ -104,6 +120,8 @@ unsafe extern "C-unwind" fn my_executor_start_hook(
 
 #[pg_guard]
 unsafe extern "C-unwind" fn my_executor_end_hook(query_desc: *mut pg_sys::QueryDesc) {
+    // Never raises: telemetry failures are contained so the previous / standard
+    // ExecutorEnd below always runs. Parallel workers are skipped inside.
     collect_spans(query_desc);
 
     // SAFETY: I am trusting the docs on this one.

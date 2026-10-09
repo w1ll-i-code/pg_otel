@@ -26,6 +26,11 @@
 //!   UTF-8, so other encodings are rejected rather than converted
 //!   (`pg_do_encoding_conversion` can itself raise errors and needs a
 //!   transaction).
+//! * Databases using the `SQL_ASCII` encoding (or any other non-UTF-8 server
+//!   encoding) therefore get **no query text at all** in normalized mode.
+//! * `raw` query text mode bypasses normalization, the input size cap and the
+//!   encoding check by design: it exports the statement as the server received
+//!   it (lossily converted to UTF-8). Only the final truncation applies.
 //! * Only literal *values* are masked. **Quoted identifiers (`"..."`) are kept
 //!   verbatim**, as are identifiers, keywords and operators.
 //! * Comments are removed, so text hidden in comments never leaves the server.
@@ -192,6 +197,15 @@ fn server_encoding_is_utf8() -> bool {
 /// truncation) are neither sent to the client nor logged. Levels already above
 /// `ERROR` are left alone. The previous values are restored on drop, which
 /// also covers unwinding.
+///
+/// The backing C variables are written directly instead of going through
+/// `SetConfigOption`/`set_config_option`: that path runs GUC assign hooks,
+/// records the change in the current transaction's GUC stack (needing an active
+/// transaction and a matching nesting level, which is not guaranteed inside an
+/// executor hook), and can itself `ereport`. Writing the variables is
+/// side-effect free and cannot fail. The trade-off is that the GUC machinery
+/// does not know about the change, so it must always be reverted before control
+/// returns to Postgres, which `Drop` guarantees.
 struct MessageSuppression {
     client_min_messages: c_int,
     log_min_messages: c_int,
@@ -213,7 +227,13 @@ impl MessageSuppression {
         }
     }
 
-    // PG19 keeps one `log_min_messages` level per backend type.
+    // PG19 keeps one `log_min_messages` level per backend type: the C variable
+    // is an array declared as `extern int log_min_messages[];` in
+    // `utils/guc.h`, which bindgen exposes as a zero-length array. Indexing it
+    // directly would be out of bounds for the Rust type, so the slot is reached
+    // through raw pointer arithmetic on the array's address. The bounds check
+    // against `B_LOGGER` (the last backend type) keeps the offset inside the
+    // real array.
     #[cfg(feature = "pg19")]
     unsafe fn log_min_messages_slot() -> Option<*mut c_int> {
         let backend_type = unsafe { pg_sys::MyBackendType } as usize;
