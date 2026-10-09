@@ -224,26 +224,9 @@ impl MessageSuppression {
         }
     }
 
-    // PG19 keeps one `log_min_messages` level per backend type: the C variable
-    // is an array declared as `extern int log_min_messages[];` in
-    // `utils/guc.h`, which bindgen exposes as a zero-length array. Indexing it
-    // directly would be out of bounds for the Rust type, so the slot is reached
-    // through raw pointer arithmetic on the array's address. The bounds check
-    // against `B_LOGGER` (the last backend type) keeps the offset inside the
-    // real array.
-    #[cfg(feature = "pg19")]
     unsafe fn log_min_messages_slot() -> Option<*mut c_int> {
-        let backend_type = unsafe { pg_sys::MyBackendType } as usize;
-        (backend_type <= pg_sys::BackendType::B_LOGGER as usize).then(|| unsafe {
-            (&raw mut pg_sys::log_min_messages)
-                .cast::<c_int>()
-                .add(backend_type)
-        })
-    }
-
-    #[cfg(not(feature = "pg19"))]
-    unsafe fn log_min_messages_slot() -> Option<*mut c_int> {
-        Some(&raw mut pg_sys::log_min_messages)
+        // SAFETY: forwarded; only called in a backend.
+        unsafe { crate::compat::log_min_messages_slot() }
     }
 
     unsafe fn log_min_messages() -> c_int {

@@ -236,11 +236,66 @@ spans all start at that same instant; each ends after its accumulated run time.
 The duration covers executor run and finish, not parsing, planning or executor
 startup. `EXPLAIN` without `ANALYZE` is not traced.
 
+## Supported PostgreSQL versions
+
+PostgreSQL **18** and **19**. Exactly one is selected at build time with a cargo
+feature; the default is `pg19`. Older versions are not supported (the
+instrumentation interfaces this extension relies on differ too much).
+
+| | PostgreSQL 18 | PostgreSQL 19 |
+| --- | --- | --- |
+| cargo feature | `pg18` | `pg19` (default) |
+| `cargo pgrx test` | `cargo pgrx test pg18` | `cargo pgrx test pg19` |
+
 ## Building
 
-To build the plugin, you need to have Rust and PostgreSQL headers installed.
-Clone the repository and run `cargo build` to build the plugin.
+You need Rust, [`cargo-pgrx`](https://github.com/pgcentralfoundation/pgrx)
+(version 0.19.1, matching the `pgrx` dependency, initialised with
+`cargo pgrx init` for the Postgres versions you build for) and the PostgreSQL
+headers.
 
+For PostgreSQL 19 (the default):
+
+```sh
+cargo pgrx install --pg-config /path/to/pg19/bin/pg_config
+cargo pgrx package --pg-config /path/to/pg19/bin/pg_config
+```
+
+For PostgreSQL 18, turn the default feature off and select `pg18`:
+
+```sh
+cargo pgrx install --no-default-features --features pg18 --pg-config /path/to/pg18/bin/pg_config
+cargo pgrx package --no-default-features --features pg18 --pg-config /path/to/pg18/bin/pg_config
+```
+
+A plain `cargo build` / `cargo clippy` builds for PostgreSQL 19; add
+`--no-default-features --features pg18` for 18. Enabling both features, or none,
+is an error. The extension must be built separately for each major version.
+
+### Differences between the versions
+
+The exported data and the configuration are the same on both versions. Inside,
+the extension adapts to how each version measures time:
+
+* **Timing source.** PostgreSQL 19 counts instrumentation in raw clock ticks
+  (TSC ticks on x86-64) which the extension converts to nanoseconds the way
+  Postgres does. PostgreSQL 18 already stores nanoseconds (statement timer) and
+  seconds as floating point numbers (plan nodes). On PostgreSQL 18 durations of
+  plan nodes therefore have the precision of a `double` in seconds, which is
+  still far below a nanosecond for realistic durations.
+* **Statement timer.** On PostgreSQL 18 the extension adds the statement timer
+  (`QueryDesc.totaltime`) right after `ExecutorStart`, like `auto_explain` and
+  `pg_stat_statements` do, and uses theirs if they already added one. There is
+  only one such timer per statement and whoever adds it first decides what it
+  measures, so pg_otel allocates it with all counters (including buffer and WAL
+  usage) exactly as those extensions do; `pg_stat_statements` and `auto_explain`
+  report the same numbers whatever the order in `shared_preload_libraries`. If
+  another extension added a statement timer *without* timing, no spans are
+  exported for that statement. PostgreSQL 19 has no such restriction: every
+  extension just adds the options it needs to the request and the executor
+  allocates the timer.
+* **Sub-plan names.** Both versions name sub-plans like EXPLAIN (`InitPlan 1`,
+  `SubPlan 2`, `CTE name`).
 
 ## Limitations
 

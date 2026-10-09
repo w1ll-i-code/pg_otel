@@ -10,15 +10,12 @@ use std::{
 use opentelemetry::trace::SpanContext;
 use pgrx::{
     PgSqlErrorCode, PgTryBuilder, debug1, log,
-    pg_sys::{
-        self,
-        InstrumentOption::{INSTRUMENT_ROWS, INSTRUMENT_TIMER},
-        Oid,
-    },
+    pg_sys::{self, Oid},
 };
 
 use crate::{
     codec::encode_batch,
+    compat,
     config::{get_max_plan_spans, get_min_duration_ms, get_otlp_traceparent, get_query_text_mode},
     shared,
     span::{
@@ -49,57 +46,30 @@ fn is_explain_only(eflags: i32) -> bool {
     eflags & pg_sys::EXEC_FLAG_EXPLAIN_ONLY as i32 != 0
 }
 
-/// Fixed-point shift used by Postgres to convert instrumentation ticks to
-/// nanoseconds (`TICKS_TO_NS_SHIFT` in `portability/instr_time.h`, a macro and
-/// therefore not part of the bindings).
-const TICKS_TO_NS_SHIFT: u32 = 14;
-
-/// Converts `instr_time` ticks to nanoseconds with the given scale factors.
-///
-/// This is a port of the static inline `pg_ticks_to_ns` of
-/// `portability/instr_time.h`. Since PG19, `instr_time.ticks` counts raw clock
-/// ticks (for example TSC ticks on x86-64), not nanoseconds. A
-/// `ticks_per_ns_scaled` of zero means the clock already counts nanoseconds.
-/// Large tick counts are scaled in two parts exactly as Postgres does so the
-/// multiplication cannot overflow; the arithmetic saturates instead of
-/// wrapping should the inputs ever be inconsistent.
-fn ticks_to_ns(ticks: i64, ticks_per_ns_scaled: u64, max_ticks_no_overflow: u64) -> i64 {
-    if ticks_per_ns_scaled == 0 {
-        return ticks;
-    }
-    let scale = i64::try_from(ticks_per_ns_scaled).unwrap_or(i64::MAX);
-    let mut ticks = ticks;
-    let mut ns = 0_i64;
-    if ticks > i64::try_from(max_ticks_no_overflow).unwrap_or(i64::MAX) {
-        let count = ticks >> TICKS_TO_NS_SHIFT;
-        ns = count.saturating_mul(scale);
-        ticks -= count << TICKS_TO_NS_SHIFT;
-    }
-    ns.saturating_add(ticks.saturating_mul(scale) >> TICKS_TO_NS_SHIFT)
-}
-
-/// Converts `instr_time.ticks` read from Postgres instrumentation to
-/// nanoseconds using this backend's timing configuration.
-pub fn instr_ticks_to_ns(ticks: i64) -> i64 {
-    // SAFETY: plain reads of process-wide variables that are initialised at
-    // backend start (`pg_initialize_timing`).
-    let (scale, max) = unsafe { (pg_sys::ticks_per_ns_scaled, pg_sys::max_ticks_no_overflow) };
-    ticks_to_ns(ticks, scale, max)
+/// Whether the executor should be asked for instrumentation for this statement.
+fn wants_instrumentation(query_desc: *mut pg_sys::QueryDesc, eflags: i32) -> bool {
+    !query_desc.is_null() && !is_explain_only(eflags) && tracing_enabled_here()
 }
 
 /// Asks the executor to collect the per-node instrumentation needed for spans.
+/// Call before `ExecutorStart`.
 ///
 /// Does nothing when tracing is disabled or for `EXPLAIN` without `ANALYZE`,
 /// so such statements pay no instrumentation overhead.
 pub fn request_instrumentation(query_desc: *mut pg_sys::QueryDesc, eflags: i32) {
-    if query_desc.is_null() || is_explain_only(eflags) || !tracing_enabled_here() {
-        return;
+    if wants_instrumentation(query_desc, eflags) {
+        // SAFETY: non-null `query_desc` of the statement about to start.
+        unsafe { compat::request_instrumentation_before_start(query_desc) };
     }
+}
 
-    // SAFETY: We check that `query_desc` is not null before dereferencing it.
-    unsafe {
-        (*query_desc).query_instr_options |= (INSTRUMENT_ROWS | INSTRUMENT_TIMER) as i32;
-        (*query_desc).instrument_options |= (INSTRUMENT_ROWS | INSTRUMENT_TIMER) as i32;
+/// The part of the instrumentation request that only works once the executor
+/// state exists (statement timing on PG18). Call after `ExecutorStart`, with the
+/// same arguments as [`request_instrumentation`].
+pub fn complete_instrumentation_request(query_desc: *mut pg_sys::QueryDesc, eflags: i32) {
+    if wants_instrumentation(query_desc, eflags) {
+        // SAFETY: non-null `query_desc` whose ExecutorStart has completed.
+        unsafe { compat::request_instrumentation_after_start(query_desc) };
     }
 }
 
@@ -162,17 +132,15 @@ fn collect_spans_unguarded(query_desc: *mut pg_sys::QueryDesc) {
         return;
     }
 
-    // SAFETY: as above. `query_instr` is null when instrumentation was not
-    // requested (tracing was disabled at ExecutorStart).
-    let Some(query_instr) = (unsafe { (*query_desc).query_instr.as_ref() }) else {
+    // Use the current time to calculate the start of the query. This is close
+    // enough to the actual end time. The measured total is the time spent in
+    // ExecutorRun and ExecutorFinish (not ExecutorStart/End). There is none when
+    // instrumentation was not requested (tracing was disabled at ExecutorStart).
+    let end_time = SystemTime::now();
+    // SAFETY: `query_desc` is non-null and valid in ExecutorEnd.
+    let Some(total_ns) = (unsafe { compat::query_total_ns(&*query_desc) }) else {
         return;
     };
-
-    // Use the current time to calculate the start of the query. This is close
-    // enough to the actual end time. `query_instr.total` is the time spent in
-    // ExecutorRun and ExecutorFinish (not ExecutorStart/End).
-    let end_time = SystemTime::now();
-    let total_ns = instr_ticks_to_ns(query_instr.total.ticks).max(0);
     if !meets_slow_query_threshold(total_ns, get_min_duration_ms()) {
         return;
     }
@@ -419,11 +387,7 @@ unsafe fn push_subplans(
         if subplan_state.planstate.is_null() || !printed_subplans.insert(subplan.plan_id) {
             continue;
         }
-        let name = subplan_display_name(
-            subplan.subLinkType == pg_sys::SubLinkType::CTE_SUBLINK,
-            subplan.isInitPlan,
-            pg_str(subplan.plan_name).as_deref().unwrap_or_default(),
-        );
+        let name = compat::subplan_display_name(subplan);
         children.push(PlanChild {
             node: subplan_state.planstate,
             edge: ChildEdge {
@@ -432,18 +396,6 @@ unsafe fn push_subplans(
             },
         });
     }
-}
-
-/// The name EXPLAIN gives a sub-plan: `CTE x`, `InitPlan 1` or `SubPlan 2`.
-fn subplan_display_name(is_cte: bool, is_init_plan: bool, plan_name: &str) -> String {
-    let kind = if is_cte {
-        "CTE"
-    } else if is_init_plan {
-        "InitPlan"
-    } else {
-        "SubPlan"
-    };
-    format!("{kind} {plan_name}")
 }
 
 /// The pointers stored in a `List` of pointers (empty for a null list).
@@ -986,80 +938,6 @@ mod unit_tests {
         assert!(!meets_slow_query_threshold(999_999, 1));
         assert!(meets_slow_query_threshold(1_000_000, 1));
         assert!(meets_slow_query_threshold(i64::MAX, i32::MAX));
-    }
-
-    /// Exact reference for the conversion: `ticks * scale / 2^14`, rounded down.
-    fn reference_ticks_to_ns(ticks: i64, scale: u64) -> i64 {
-        ((i128::from(ticks) * i128::from(scale)) >> TICKS_TO_NS_SHIFT) as i64
-    }
-
-    #[test]
-    fn ticks_are_nanoseconds_when_scale_is_zero() {
-        assert_eq!(ticks_to_ns(123_456, 0, 0), 123_456);
-        assert_eq!(ticks_to_ns(i64::MAX, 0, 0), i64::MAX);
-    }
-
-    #[test]
-    fn converts_tsc_ticks_with_fixed_point_scale() {
-        // 3 GHz TSC: scale = (1e6 << 14) / 3_000_000 kHz = 5461 (1/3 ns per tick).
-        let scale = (1_000_000_u64 << TICKS_TO_NS_SHIFT) / 3_000_000;
-        let max = (i64::MAX as u64) / scale;
-        assert_eq!(scale, 5461);
-        assert_eq!(ticks_to_ns(0, scale, max), 0);
-        assert_eq!(ticks_to_ns(16_384, scale, max), 5_461);
-        // One second of ticks is one second up to the fixed-point rounding error.
-        let one_second = ticks_to_ns(3_000_000_000, scale, max);
-        assert!(
-            (999_000_000..=1_000_000_000).contains(&one_second),
-            "{one_second}"
-        );
-    }
-
-    #[test]
-    fn matches_exact_arithmetic_including_the_overflow_branch() {
-        for &(scale, max_ticks) in &[
-            (5461_u64, i64::MAX as u64 / 5461),
-            (16_384, i64::MAX as u64 / 16_384),
-            (1, i64::MAX as u64),
-        ] {
-            let mut samples = vec![
-                0,
-                1,
-                16_383,
-                16_384,
-                16_385,
-                max_ticks as i64 - 1,
-                max_ticks as i64,
-                (max_ticks as i64).saturating_add(1),
-                i64::MAX / 2,
-            ];
-            let mut rng = fastrand::Rng::with_seed(7);
-            samples.extend((0..2_000).map(|_| rng.i64(0..=max_ticks as i64)));
-            samples.extend((0..2_000).map(|_| rng.i64(0..=i64::MAX)));
-            for ticks in samples {
-                let expected = reference_ticks_to_ns(ticks, scale);
-                assert_eq!(
-                    ticks_to_ns(ticks, scale, max_ticks),
-                    expected,
-                    "ticks={ticks} scale={scale}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn conversion_saturates_instead_of_overflowing() {
-        // Inconsistent inputs (max too large for the scale) must not panic.
-        assert!(ticks_to_ns(i64::MAX, 1 << 40, u64::MAX) > 0);
-        assert!(ticks_to_ns(i64::MAX, u64::MAX, 0) > 0);
-    }
-
-    #[test]
-    fn subplan_names_follow_explain() {
-        assert_eq!(subplan_display_name(false, true, "1"), "InitPlan 1");
-        assert_eq!(subplan_display_name(false, false, "2"), "SubPlan 2");
-        assert_eq!(subplan_display_name(true, true, "c"), "CTE c");
-        assert_eq!(subplan_display_name(true, false, "c"), "CTE c");
     }
 
     #[test]
@@ -1641,6 +1519,31 @@ mod tests {
             plan_nodes(&spans).len()
         );
         assert!(attr(query_span(&spans), "postgresql.plan.spans_truncated").is_none());
+    }
+
+    /// pg_otel is preloaded before pg_stat_statements (see `pg_test::postgresql_conf_options`),
+    /// the order in which a statement timer allocated without buffer/WAL usage
+    /// would starve pg_stat_statements.
+    #[pg_test]
+    fn pg_stat_statements_still_sees_buffer_usage() {
+        Spi::run("CREATE EXTENSION pg_stat_statements").unwrap();
+        Spi::run("CREATE TABLE otel_pgss_t AS SELECT g AS i FROM generate_series(1, 1000) g")
+            .unwrap();
+        Spi::run("SET pg_otel.min_duration_ms = 0").unwrap();
+        // The test function itself is a top-level statement, so the statement
+        // under test is nested and only tracked with `track = all`.
+        Spi::run("SET pg_stat_statements.track = 'all'").unwrap();
+        Spi::run("SELECT pg_stat_statements_reset()").unwrap();
+
+        Spi::run("SELECT count(*) FROM otel_pgss_t").unwrap();
+
+        let blocks = Spi::get_one::<i64>(
+            "SELECT sum(shared_blks_hit + shared_blks_read)::bigint FROM pg_stat_statements \
+             WHERE query LIKE 'SELECT count(*) FROM otel_pgss_t%'",
+        )
+        .unwrap()
+        .expect("pg_stat_statements recorded the statement");
+        assert!(blocks > 0, "no buffer usage recorded: {blocks}");
     }
 
     #[pg_test]

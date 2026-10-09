@@ -10,11 +10,12 @@ use opentelemetry::{
     trace::{SpanContext, SpanKind, Status, TraceContextExt, TraceState},
 };
 use opentelemetry_sdk::{propagation::TraceContextPropagator, trace::SpanData};
-use pgrx::pg_sys::{self, CmdType, NodeInstrumentation, PlanState, QueryDesc};
+use pgrx::pg_sys::{self, CmdType, PlanState, QueryDesc};
 
 use crate::{
+    compat::{self, NodeInstrument, NodeStats},
     config::QueryTextMode,
-    postgres::{instr_ticks_to_ns, plan_table_name},
+    postgres::plan_table_name,
     sanitize,
 };
 
@@ -293,7 +294,7 @@ impl SpanRecord {
     /// Builds the span of a whole statement.
     ///
     /// The span covers `wall_start` up to the time Postgres spent in
-    /// ExecutorRun/Finish (`query_instr.total`). `span_id` is chosen by the
+    /// ExecutorRun/Finish (see [`compat::query_total_ns`]). `span_id` is chosen by the
     /// caller so plan nodes can reference it as their parent before this span
     /// exists, `tables` are the relations scanned by the plan, and `plan_spans_omitted` the
     /// number of plan nodes left out of the trace. Calls into
@@ -309,7 +310,8 @@ impl SpanRecord {
         plan_spans_omitted: usize,
     ) -> Option<Self> {
         let query_desc = unsafe { query_desc.as_ref()? };
-        let instrument = unsafe { query_desc.query_instr.as_ref()? };
+        // SAFETY: `query_desc` is valid in ExecutorEnd.
+        let total_ns = unsafe { compat::query_total_ns(query_desc)? };
 
         let operation = query_name(query_desc.operation);
         let name = format!(
@@ -321,7 +323,6 @@ impl SpanRecord {
                 .join(", ")
         );
 
-        let total_ns = instr_ticks_to_ns(instrument.total.ticks).max(0);
         let end_time = wall_start + Duration::from_nanos(total_ns as u64);
         let (query_text, query_id) = exported_query_text_and_id(query_desc, query_text_mode);
 
@@ -361,16 +362,12 @@ impl SpanRecord {
     ) -> Option<Self> {
         let plan_node = unsafe { plan_node.as_ref() }?;
         let plan = unsafe { plan_node.plan.as_ref() }?;
-        let instrument = unsafe { finished_node_instrumentation(plan_node.instrument) };
-
-        let (timings, never_executed, incomplete) = match &instrument {
-            NodeInstrument::Done(instrument) => (
-                NodeTimings::from(*instrument),
-                instrument.nloops == 0.0,
-                false,
-            ),
-            NodeInstrument::Incomplete => (NodeTimings::default(), false, true),
-        };
+        // SAFETY: the plan state is valid and not used by anyone else now.
+        let (timings, never_executed, incomplete) =
+            match unsafe { compat::node_instrument(plan_node) } {
+                NodeInstrument::Done(stats) => (stats, stats.loops == 0.0, false),
+                NodeInstrument::Incomplete => (NodeStats::default(), false, true),
+            };
         let end_time =
             (wall_start + Duration::from_nanos(timings.total_ns as u64)).min(parent.end_time);
 
@@ -427,32 +424,6 @@ fn plan_span_name(subplan_name: Option<&str>, node_type: &str, table_suffix: &st
     }
 }
 
-/// The measured numbers of a plan node, converted to nanoseconds.
-#[derive(Debug, Default)]
-struct NodeTimings {
-    startup_ns: i64,
-    total_ns: i64,
-    rows: f64,
-    secondary_rows: f64,
-    loops: f64,
-    filtered_by_scan_or_join: f64,
-    filtered_by_other: f64,
-}
-
-impl From<&NodeInstrumentation> for NodeTimings {
-    fn from(instrument: &NodeInstrumentation) -> Self {
-        Self {
-            startup_ns: instr_ticks_to_ns(instrument.startup.ticks).max(0),
-            total_ns: instr_ticks_to_ns(instrument.instr.total.ticks).max(0),
-            rows: instrument.ntuples,
-            secondary_rows: instrument.ntuples2,
-            loops: instrument.nloops,
-            filtered_by_scan_or_join: instrument.nfiltered1,
-            filtered_by_other: instrument.nfiltered2,
-        }
-    }
-}
-
 /// Members that run-time partition pruning removed from an Append or
 /// MergeAppend (EXPLAIN's "Subplans Removed").
 ///
@@ -505,44 +476,6 @@ fn list_length(list: *const pg_sys::List) -> i32 {
 /// `s` cut to at most `max_bytes` bytes on a character boundary.
 fn truncated(s: &str, max_bytes: usize) -> String {
     sanitize::truncate_utf8(s, max_bytes).to_owned()
-}
-
-/// What could be read from a plan node's instrumentation.
-enum NodeInstrument<'a> {
-    /// The last cycle was folded into the totals (see below).
-    Done(&'a NodeInstrumentation),
-    /// There is no instrumentation, or the node was interrupted mid-run.
-    Incomplete,
-}
-
-/// Folds the node's last execution cycle into its totals (as `ExplainNode`
-/// does) and returns the instrumentation.
-///
-/// `InstrEndLoop` is a no-op for a node that is not `running` (never ran, or
-/// already folded in), so repeated calls are harmless. It raises an ERROR for a
-/// node that is `running` while its timer is still started (execution was
-/// interrupted mid-node); that node is reported as [`NodeInstrument::Incomplete`]
-/// instead of failing the whole collection, and its children are still walked.
-///
-/// # Safety
-///
-/// `instrument` must be null or point to valid node instrumentation that no one
-/// else is accessing.
-unsafe fn finished_node_instrumentation<'a>(
-    instrument: *mut NodeInstrumentation,
-) -> NodeInstrument<'a> {
-    // SAFETY: validity per the function contract.
-    let Some(instrument) = (unsafe { instrument.as_mut() }) else {
-        return NodeInstrument::Incomplete;
-    };
-    if instrument.running {
-        if instrument.instr.starttime.ticks != 0 {
-            return NodeInstrument::Incomplete;
-        }
-        // SAFETY: valid, exclusively accessed instrumentation (see above).
-        unsafe { pg_sys::InstrEndLoop(instrument) };
-    }
-    NodeInstrument::Done(instrument)
 }
 
 /// Query text to export and the query id, according to `mode`.

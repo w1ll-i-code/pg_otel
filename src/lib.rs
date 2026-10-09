@@ -7,11 +7,12 @@ use pgrx::{
 
 use crate::{
     config::ExporterConfig,
-    postgres::{collect_spans, request_instrumentation},
+    postgres::{collect_spans, complete_instrumentation_request, request_instrumentation},
     worker::background_worker_run,
 };
 
 mod codec;
+mod compat;
 mod config;
 mod postgres;
 mod queue;
@@ -64,14 +65,7 @@ pub extern "C-unwind" fn _PG_init() {
 /// silently accepting them as placeholders.
 fn reserve_guc_prefix() {
     // SAFETY: called from `_PG_init` after all `pg_otel.*` GUCs are defined.
-    #[cfg(not(any(feature = "pg13", feature = "pg14")))]
-    unsafe {
-        pg_sys::MarkGUCPrefixReserved(c"pg_otel".as_ptr());
-    }
-    #[cfg(any(feature = "pg13", feature = "pg14"))]
-    unsafe {
-        pg_sys::EmitWarningsOnPlaceholders(c"pg_otel".as_ptr());
-    }
+    unsafe { pg_sys::MarkGUCPrefixReserved(c"pg_otel".as_ptr()) };
 }
 
 #[pg_guard]
@@ -123,6 +117,10 @@ unsafe extern "C-unwind" fn my_executor_start_hook(
             pg_sys::standard_ExecutorStart(query_desc, eflags);
         }
     }
+
+    // PG18 can only allocate the statement timer once the executor state
+    // exists; a no-op on PG19.
+    complete_instrumentation_request(query_desc, eflags);
 }
 
 #[pg_guard]
@@ -152,6 +150,10 @@ pub mod pg_test {
     #[must_use]
     pub fn postgresql_conf_options() -> Vec<&'static str> {
         // `_PG_init` refuses to run unless the library is preloaded.
-        vec!["shared_preload_libraries = 'pg_otel'"]
+        // pg_stat_statements comes *after* pg_otel on purpose: it needs
+        // statement-level buffer and WAL usage that pg_otel's own
+        // instrumentation request must not take away (see the test
+        // `pg_stat_statements_still_sees_buffer_usage`).
+        vec!["shared_preload_libraries = 'pg_otel,pg_stat_statements'"]
     }
 }
