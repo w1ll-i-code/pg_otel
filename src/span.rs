@@ -1,9 +1,4 @@
-#![allow(dead_code)]
-
-use std::{
-    time::{Duration, SystemTime},
-    usize,
-};
+use std::time::{Duration, SystemTime};
 
 use opentelemetry::{
     Array, InstrumentationScope, KeyValue, SpanId, StringValue, TraceFlags, TraceId, Value,
@@ -13,10 +8,14 @@ use opentelemetry::{
 use opentelemetry_sdk::{propagation::TraceContextPropagator, trace::SpanData};
 use pgrx::{
     log,
-    pg_sys::{CmdType, NodeTag, PlanState, QueryDesc},
+    pg_sys::{self, CmdType, NodeInstrumentation, NodeTag, PlanState, QueryDesc},
 };
 
-use crate::postgres::{collect_table_names, pg_str, plan_table_name};
+use crate::{
+    config::QueryTextMode,
+    postgres::{collect_table_names, instr_ticks_to_ns, plan_table_name},
+    sanitize,
+};
 
 /// Flags of every exported span. Spans are only collected when the trace is
 /// sampled (a remote parent with the sampled flag cleared suppresses
@@ -79,7 +78,7 @@ pub fn random_span_id() -> SpanId {
     }
 }
 
-const QUERY_TEXT_MAX_LEN: usize = 512;
+pub const QUERY_TEXT_MAX_LEN: usize = 512;
 const PLAN_NODE_NAME_MAX_LEN: usize = 64;
 const PLAN_TABLES_MAX_LEN: usize = 12;
 
@@ -96,9 +95,12 @@ pub struct HeaplessSpan {
 pub struct QueryAttributes {
     parent_is_remote: bool,
     operation: CmdType::Type,
-    query_text: heapless::String<QUERY_TEXT_MAX_LEN>,
-    exec_startup_time_seconds: f64,
-    exec_total_time_seconds: f64,
+    /// `None` when `pg_otel.query_text` is `off` or the text could not be
+    /// produced safely.
+    query_text: Option<heapless::String<QUERY_TEXT_MAX_LEN>>,
+    /// Postgres' query id; `0` means it was not computed.
+    query_id: i64,
+    exec_total_time_ns: i64,
 }
 
 pub struct PlanNodeAttributes {
@@ -111,8 +113,8 @@ pub struct PlanNodeAttributes {
     plan_parallel_aware: bool,
     plan_parallel_safe: bool,
     plan_async_capable: bool,
-    instr_startup_time_seconds: f64,
-    instr_total_time_seconds: f64,
+    instr_startup_time_ns: i64,
+    instr_total_time_ns: i64,
     instr_rows: f64,
     instr_secondary_rows: f64,
     instr_loops: f64,
@@ -120,19 +122,29 @@ pub struct PlanNodeAttributes {
     instr_rows_removed_by_other_filter: f64,
 }
 
+// The spans live inline in a shared-memory queue, so the larger variant cannot
+// be boxed (a pointer would be meaningless in another process).
+#[allow(clippy::large_enum_variant)]
 pub enum HeaplessSpanAttributes {
     Query(QueryAttributes),
     PlanNode(PlanNodeAttributes),
 }
 
 impl HeaplessSpan {
+    /// Builds the span of a whole statement.
+    ///
+    /// The span covers `wall_start` up to the time Postgres spent in
+    /// ExecutorRun/Finish (`query_instr.total`). Calls into Postgres to
+    /// sanitize the query text, so it must not run while the span queue lock is
+    /// held.
     pub fn from_query(
         query_desc: *const QueryDesc,
         wall_start: SystemTime,
         parent: &ParentContext,
+        query_text_mode: QueryTextMode,
     ) -> Option<Self> {
         let query_desc = unsafe { query_desc.as_ref()? };
-        let plan_state = unsafe { (*query_desc).planstate.as_ref()? };
+        let plan_state = unsafe { query_desc.planstate.as_ref()? };
         let instrument = unsafe { query_desc.query_instr.as_ref()? };
 
         let operation = query_desc.operation;
@@ -143,41 +155,44 @@ impl HeaplessSpan {
             String::from(query_name) + " " + &tables.join(", ")
         };
 
-        let query_text = pg_str(query_desc.sourceText).unwrap_or_default();
-
-        let start_time = wall_start + Duration::from_nanos(instrument.starttime.ticks as u64);
-        let end_time = start_time + Duration::from_nanos(instrument.total.ticks as u64);
-        let exec_startup_time_seconds = instrument.starttime.ticks as f64 / 1e9;
-        let exec_total_time_seconds = instrument.total.ticks as f64 / 1e9;
+        let total_ns = instr_ticks_to_ns(instrument.total.ticks).max(0);
+        let end_time = wall_start + Duration::from_nanos(total_ns as u64);
+        let (query_text, query_id) = exported_query_text_and_id(query_desc, query_text_mode);
 
         Some(HeaplessSpan {
             trace_id: parent.trace_id,
             span_id: random_span_id(),
             parent_id: parent.span_id,
             name: truncate(&name),
-            start_time,
+            start_time: wall_start,
             end_time,
             attributes: HeaplessSpanAttributes::Query(QueryAttributes {
                 parent_is_remote: parent.is_remote,
                 operation,
-                query_text: truncate(&query_text),
-                exec_startup_time_seconds,
-                exec_total_time_seconds,
+                query_text,
+                query_id,
+                exec_total_time_ns: total_ns,
             }),
         })
     }
 
+    /// Builds the span of one plan node.
+    ///
+    /// Postgres keeps no per-node wall-clock start (only accumulated durations),
+    /// so every node starts at the query start (`wall_start`) and ends after its
+    /// accumulated run time, capped at the end of its parent.
     pub fn from_plan(
-        plan_node: *const PlanState,
+        plan_node: *mut PlanState,
         wall_start: SystemTime,
         parent: &HeaplessSpan,
     ) -> Option<Self> {
         let plan_node = unsafe { plan_node.as_ref() }?;
-        let instrument = unsafe { plan_node.instrument.as_ref() }?;
+        let instrument = unsafe { finished_node_instrumentation(plan_node.instrument) }?;
         let plan = unsafe { plan_node.plan.as_ref() }?;
 
-        let start_time = wall_start + Duration::from_nanos(instrument.instr.starttime.ticks as u64);
-        let end_time = wall_start + Duration::from_nanos(instrument.instr.total.ticks as u64);
+        let total_ns = instr_ticks_to_ns(instrument.instr.total.ticks).max(0);
+        let startup_ns = instr_ticks_to_ns(instrument.startup.ticks).max(0);
+        let end_time = (wall_start + Duration::from_nanos(total_ns as u64)).min(parent.end_time);
 
         let plan_table_names = collect_table_names(plan_node);
         let plan_table_len = plan_table_names.len();
@@ -204,7 +219,7 @@ impl HeaplessSpan {
             span_id: random_span_id(),
             parent_id: parent.span_id,
             name,
-            start_time,
+            start_time: wall_start,
             end_time,
             attributes: HeaplessSpanAttributes::PlanNode(PlanNodeAttributes {
                 plan_node_type: plan_node.type_,
@@ -216,8 +231,8 @@ impl HeaplessSpan {
                 plan_parallel_safe: plan.parallel_safe,
                 plan_async_capable: plan.async_capable,
                 plan_tables,
-                instr_startup_time_seconds: instrument.startup.ticks as f64 / 1e9,
-                instr_total_time_seconds: instrument.instr.total.ticks as f64 / 1e9,
+                instr_startup_time_ns: startup_ns,
+                instr_total_time_ns: total_ns,
                 instr_rows: instrument.ntuples,
                 instr_secondary_rows: instrument.ntuples2,
                 instr_loops: instrument.nloops,
@@ -226,6 +241,79 @@ impl HeaplessSpan {
             }),
         })
     }
+}
+
+/// Folds the node's last execution cycle into its totals (as `ExplainNode`
+/// does) and returns the instrumentation, or `None` if the node has none.
+///
+/// `InstrEndLoop` is a no-op for a node that is not `running` (never ran, or
+/// already folded in), so repeated calls are harmless. It raises an ERROR for a
+/// node that is `running` while its timer is still started (execution was
+/// interrupted mid-node); such a node is skipped instead of failing collection.
+///
+/// # Safety
+///
+/// `instrument` must be null or point to valid node instrumentation that no one
+/// else is accessing.
+unsafe fn finished_node_instrumentation<'a>(
+    instrument: *mut NodeInstrumentation,
+) -> Option<&'a NodeInstrumentation> {
+    // SAFETY: null check by `as_mut`; validity per the function contract.
+    let instrument = unsafe { instrument.as_mut()? };
+    if instrument.running {
+        if instrument.instr.starttime.ticks != 0 {
+            return None;
+        }
+        // SAFETY: valid, exclusively accessed instrumentation (see above).
+        unsafe { pg_sys::InstrEndLoop(instrument) };
+    }
+    Some(instrument)
+}
+
+/// Query text to export and the query id, according to `mode`.
+fn exported_query_text_and_id(
+    query_desc: &QueryDesc,
+    mode: QueryTextMode,
+) -> (Option<heapless::String<QUERY_TEXT_MAX_LEN>>, i64) {
+    // SAFETY: `plannedstmt` is null or valid for the duration of the hook.
+    let (stmt_location, stmt_len, query_id) = match unsafe { query_desc.plannedstmt.as_ref() } {
+        Some(stmt) => (stmt.stmt_location, stmt.stmt_len, stmt.queryId),
+        None => (-1, 0, 0),
+    };
+    let text = normalize_for(mode).and_then(|normalize| {
+        // SAFETY: `sourceText` is null or a NUL-terminated string that outlives
+        // the hook. `sanitize` truncates to the capacity of the target string.
+        let text = unsafe {
+            sanitize::sanitize(
+                query_desc.sourceText,
+                stmt_location,
+                stmt_len,
+                normalize,
+                QUERY_TEXT_MAX_LEN,
+            )
+        }?;
+        heapless::String::try_from(text.as_str()).ok()
+    });
+    (text, query_id)
+}
+
+/// Whether the query text must be normalized; `None` means "do not export".
+fn normalize_for(mode: QueryTextMode) -> Option<bool> {
+    match mode {
+        QueryTextMode::Off => None,
+        QueryTextMode::Normalized => Some(true),
+        QueryTextMode::Raw => Some(false),
+    }
+}
+
+/// Seconds, for the `*_time_seconds` attributes.
+fn ns_to_seconds(ns: i64) -> f64 {
+    ns as f64 / 1e9
+}
+
+/// Microseconds, for `span.duration.us`.
+fn ns_to_micros(ns: i64) -> f64 {
+    ns as f64 / 1e3
 }
 
 fn query_name(command: CmdType::Type) -> &'static str {
@@ -258,7 +346,26 @@ impl From<HeaplessSpan> for SpanData {
         match span.attributes {
             HeaplessSpanAttributes::Query(attr) => {
                 let operation = query_name(attr.operation);
-                let query_text = attr.query_text.as_str().to_owned();
+                let mut attributes = vec![
+                    KeyValue::new("db.operation", operation),
+                    KeyValue::new("db.system", "postgresql"),
+                    KeyValue::new(
+                        "postgresql.execution.total_time_seconds",
+                        ns_to_seconds(attr.exec_total_time_ns),
+                    ),
+                    KeyValue::new("span.duration.us", ns_to_micros(attr.exec_total_time_ns)),
+                    KeyValue::new("span.type", "db"),
+                    KeyValue::new("span.subtype", "postgresql"),
+                ];
+                if let Some(query_text) = &attr.query_text {
+                    attributes.push(KeyValue::new(
+                        "db.query.text",
+                        query_text.as_str().to_owned(),
+                    ));
+                }
+                if attr.query_id != 0 {
+                    attributes.push(KeyValue::new("db.query.id", attr.query_id));
+                }
 
                 SpanData {
                     span_context,
@@ -268,22 +375,7 @@ impl From<HeaplessSpan> for SpanData {
                     name: span.name.as_str().to_owned().into(),
                     start_time: span.start_time,
                     end_time: span.end_time,
-                    attributes: vec![
-                        KeyValue::new("db.operation", operation),
-                        KeyValue::new("db.statement", query_text),
-                        KeyValue::new("db.system", "postgresql"),
-                        KeyValue::new(
-                            "postgresql.execution.startup_time_seconds",
-                            attr.exec_startup_time_seconds,
-                        ),
-                        KeyValue::new(
-                            "postgresql.execution.total_time_seconds",
-                            attr.exec_total_time_seconds,
-                        ),
-                        KeyValue::new("span.duration.us", attr.exec_total_time_seconds / 1e6),
-                        KeyValue::new("span.type", "db"),
-                        KeyValue::new("span.subtype", "postgresql"),
-                    ],
+                    attributes,
                     dropped_attributes_count: 0,
                     events: Default::default(),
                     links: Default::default(),
@@ -325,11 +417,11 @@ impl From<HeaplessSpan> for SpanData {
                         KeyValue::new("postgresql.plan.async_capable", attr.plan_async_capable),
                         KeyValue::new(
                             "postgresql.instrumentation.startup_time_seconds",
-                            attr.instr_startup_time_seconds,
+                            ns_to_seconds(attr.instr_startup_time_ns),
                         ),
                         KeyValue::new(
                             "postgresql.instrumentation.total_time_seconds",
-                            attr.instr_total_time_seconds,
+                            ns_to_seconds(attr.instr_total_time_ns),
                         ),
                         KeyValue::new("postgresql.instrumentation.rows", attr.instr_rows),
                         KeyValue::new(
@@ -345,7 +437,7 @@ impl From<HeaplessSpan> for SpanData {
                             "postgresql.instrumentation.rows_removed_by_other_filter",
                             attr.instr_rows_removed_by_other_filter,
                         ),
-                        KeyValue::new("span.duration.us", attr.instr_total_time_seconds * 1e3),
+                        KeyValue::new("span.duration.us", ns_to_micros(attr.instr_total_time_ns)),
                         KeyValue::new("span.type", "db"),
                         KeyValue::new("span.subtype", "internal"),
                     ],
@@ -386,7 +478,7 @@ impl<'a> TraceParentExtractor<'a> {
     }
 }
 
-impl<'a> Extractor for TraceParentExtractor<'_> {
+impl Extractor for TraceParentExtractor<'_> {
     fn get(&self, key: &str) -> Option<&str> {
         if key.eq_ignore_ascii_case("traceparent") {
             Some(self.parent)
@@ -492,6 +584,20 @@ mod tests {
         ] {
             assert!(parse_traceparent(invalid).is_none(), "accepted {invalid:?}");
         }
+    }
+
+    #[test]
+    fn duration_units_are_seconds_and_microseconds() {
+        assert_eq!(ns_to_seconds(1_500_000_000), 1.5);
+        assert_eq!(ns_to_micros(1_500_000), 1_500.0);
+        assert_eq!(ns_to_micros(0), 0.0);
+    }
+
+    #[test]
+    fn query_text_modes_map_to_normalization() {
+        assert_eq!(normalize_for(QueryTextMode::Off), None);
+        assert_eq!(normalize_for(QueryTextMode::Normalized), Some(true));
+        assert_eq!(normalize_for(QueryTextMode::Raw), Some(false));
     }
 
     #[test]

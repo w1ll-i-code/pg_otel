@@ -105,8 +105,9 @@ unsafe extern "C-unwind" fn my_executor_start_hook(
     query_desc: *mut pg_sys::QueryDesc,
     eflags: i32,
 ) {
-    // Does nothing when tracing is disabled or in parallel workers.
-    request_instrumentation(query_desc);
+    // Does nothing when tracing is disabled, in parallel workers, or for
+    // EXPLAIN without ANALYZE.
+    request_instrumentation(query_desc, eflags);
 
     // SAFETY: I am trusting the docs on this one.
     unsafe {

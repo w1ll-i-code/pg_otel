@@ -67,9 +67,12 @@ and dropped.
 to `pg_otel.service_name` and `pg_otel.traceparent`. Update `postgresql.conf`
 and clients; the old names are no longer used by the extension.
 
-> **Note:** `pg_otel.query_text` and `pg_otel.queue_size_kb` are registered but
-> not yet applied. Until they are wired in, the queue length is fixed at 1024
-> spans and the query text is exported unsanitized (truncated).
+`pg_otel.query_text` is applied to the exported statement: only the statement
+being executed is exported (not other statements of a multi-statement string),
+cut to 512 bytes. In `off` mode no `db.query.text` attribute is set.
+
+> **Note:** `pg_otel.queue_size_kb` is registered but not yet applied; the queue
+> length is still fixed at 1024 spans.
 
 ## Usage
 
@@ -111,6 +114,34 @@ they share it.
 If the `traceparent` has the sampled flag cleared (`...-00`), no spans are
 exported for the statement, as W3C trace context specifies. Note that this lets
 a user suppress tracing of their own statements by supplying such a value.
+
+## Exported spans
+
+Each traced statement produces one query span with one child span per plan
+node.
+
+Query span attributes:
+
+| Attribute | Description |
+| --- | --- |
+| `db.system` | Always `postgresql`. |
+| `db.operation` | `SELECT`, `INSERT`, ... |
+| `db.query.text` | The statement, according to `pg_otel.query_text`. Absent in `off` mode (and in `normalized` mode when normalization is not possible). |
+| `db.query.id` | Postgres' query id; only present when it is computed (`compute_query_id`, for example enabled by `pg_stat_statements`). |
+| `postgresql.execution.total_time_seconds` | Time spent executing the statement, in seconds. |
+| `span.duration.us` | The same duration in **microseconds**. |
+
+Plan node spans carry `postgresql.plan.*` (planner estimates) and
+`postgresql.instrumentation.*` (actual rows, loops, filtered rows, startup and
+total time in seconds) attributes, plus `span.duration.us` in microseconds.
+
+Timing notes: Postgres only records accumulated durations, not wall-clock
+timestamps, per plan node. The query span starts at the time the statement began
+executing (derived from the end time and the measured duration) and plan node
+spans all start at that same instant; each ends after its accumulated run time.
+The duration covers executor run and finish, not parsing, planning or executor
+startup. Nodes interrupted mid-execution are skipped. `EXPLAIN` without
+`ANALYZE` is not traced.
 
 ## Building
 

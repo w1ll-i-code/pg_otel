@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     ffi::CStr,
     panic::AssertUnwindSafe,
     sync::atomic::{AtomicBool, Ordering},
@@ -17,7 +18,7 @@ use pgrx::{
 
 use crate::{
     DEQUE, WORKER_PID,
-    config::{get_min_duration_ms, get_otlp_traceparent},
+    config::{get_min_duration_ms, get_otlp_traceparent, get_query_text_mode},
     span::{HeaplessSpan, ParentContext, parse_traceparent},
 };
 
@@ -37,12 +38,56 @@ fn tracing_enabled_here() -> bool {
     })
 }
 
+/// `EXPLAIN` without `ANALYZE` plans and starts the executor but never runs
+/// it, so there is nothing to report.
+fn is_explain_only(eflags: i32) -> bool {
+    eflags & pg_sys::EXEC_FLAG_EXPLAIN_ONLY as i32 != 0
+}
+
+/// Fixed-point shift used by Postgres to convert instrumentation ticks to
+/// nanoseconds (`TICKS_TO_NS_SHIFT` in `portability/instr_time.h`, a macro and
+/// therefore not part of the bindings).
+const TICKS_TO_NS_SHIFT: u32 = 14;
+
+/// Converts `instr_time` ticks to nanoseconds with the given scale factors.
+///
+/// This is a port of the static inline `pg_ticks_to_ns` of
+/// `portability/instr_time.h`. Since PG19, `instr_time.ticks` counts raw clock
+/// ticks (for example TSC ticks on x86-64), not nanoseconds. A
+/// `ticks_per_ns_scaled` of zero means the clock already counts nanoseconds.
+/// Large tick counts are scaled in two parts exactly as Postgres does so the
+/// multiplication cannot overflow; the arithmetic saturates instead of
+/// wrapping should the inputs ever be inconsistent.
+fn ticks_to_ns(ticks: i64, ticks_per_ns_scaled: u64, max_ticks_no_overflow: u64) -> i64 {
+    if ticks_per_ns_scaled == 0 {
+        return ticks;
+    }
+    let scale = i64::try_from(ticks_per_ns_scaled).unwrap_or(i64::MAX);
+    let mut ticks = ticks;
+    let mut ns = 0_i64;
+    if ticks > i64::try_from(max_ticks_no_overflow).unwrap_or(i64::MAX) {
+        let count = ticks >> TICKS_TO_NS_SHIFT;
+        ns = count.saturating_mul(scale);
+        ticks -= count << TICKS_TO_NS_SHIFT;
+    }
+    ns.saturating_add(ticks.saturating_mul(scale) >> TICKS_TO_NS_SHIFT)
+}
+
+/// Converts `instr_time.ticks` read from Postgres instrumentation to
+/// nanoseconds using this backend's timing configuration.
+pub fn instr_ticks_to_ns(ticks: i64) -> i64 {
+    // SAFETY: plain reads of process-wide variables that are initialised at
+    // backend start (`pg_initialize_timing`).
+    let (scale, max) = unsafe { (pg_sys::ticks_per_ns_scaled, pg_sys::max_ticks_no_overflow) };
+    ticks_to_ns(ticks, scale, max)
+}
+
 /// Asks the executor to collect the per-node instrumentation needed for spans.
 ///
-/// Does nothing when tracing is disabled, so untraced statements pay no
-/// instrumentation overhead.
-pub fn request_instrumentation(query_desc: *mut pg_sys::QueryDesc) {
-    if query_desc.is_null() || !tracing_enabled_here() {
+/// Does nothing when tracing is disabled or for `EXPLAIN` without `ANALYZE`,
+/// so such statements pay no instrumentation overhead.
+pub fn request_instrumentation(query_desc: *mut pg_sys::QueryDesc, eflags: i32) {
+    if query_desc.is_null() || is_explain_only(eflags) || !tracing_enabled_here() {
         return;
     }
 
@@ -102,45 +147,68 @@ fn collect_spans_unguarded(query_desc: *mut pg_sys::QueryDesc) {
     }
     fault::inject();
 
-    // SAFETY: `query_desc` is non-null and valid for the duration of the hook.
-    // `query_instr` is null when instrumentation was not requested (tracing
-    // was disabled at ExecutorStart).
+    // SAFETY: `query_desc` is non-null and valid for the duration of the hook;
+    // `estate` is set by ExecutorStart.
+    let explain_only = unsafe {
+        let estate = (*query_desc).estate;
+        !estate.is_null() && is_explain_only((*estate).es_top_eflags)
+    };
+    if explain_only {
+        return;
+    }
+
+    // SAFETY: as above. `query_instr` is null when instrumentation was not
+    // requested (tracing was disabled at ExecutorStart).
     let Some(query_instr) = (unsafe { (*query_desc).query_instr.as_ref() }) else {
         return;
     };
 
-    // Use the current time to calculate the duration of the query.
-    // This should be close enough to the actual end time.
+    // Use the current time to calculate the start of the query. This is close
+    // enough to the actual end time. `query_instr.total` is the time spent in
+    // ExecutorRun and ExecutorFinish (not ExecutorStart/End).
     let end_time = SystemTime::now();
-    let total = query_instr.total.ticks;
-    if !meets_slow_query_threshold(total, get_min_duration_ms()) {
+    let total_ns = instr_ticks_to_ns(query_instr.total.ticks).max(0);
+    if !meets_slow_query_threshold(total_ns, get_min_duration_ms()) {
         return;
     }
-    let wall_start = end_time - Duration::from_nanos(total as u64);
+    let wall_start = end_time - Duration::from_nanos(total_ns as u64);
 
     let source_text = pg_str(unsafe { (*query_desc).sourceText });
     let guc_traceparent = get_otlp_traceparent();
-    let parent = match decide_parent(guc_traceparent.as_deref(), source_text) {
+    let parent = match decide_parent(guc_traceparent.as_deref(), source_text.as_deref()) {
         TraceDecision::Skip => return,
         TraceDecision::Trace(parent) => parent,
     };
-    let Some(span) = HeaplessSpan::from_query(query_desc, wall_start, &parent) else {
+    // Builds (and sanitizes) the query text. This can call into Postgres, so it
+    // must happen before any span is published under the DEQUE lock.
+    let Some(span) =
+        HeaplessSpan::from_query(query_desc, wall_start, &parent, get_query_text_mode())
+    else {
         return;
     };
 
     let planstate = unsafe { (*query_desc).planstate };
     collect_plan_spans(planstate, wall_start, &span);
-    // Never call Postgres code while holding the DEQUE guard: if that code
-    // raised an ERROR that we catch, the LWLock would leak (pgrx only releases
-    // it on unwind when InterruptHoldoffCount is non-zero), and every later
-    // enqueue would hang. Build the span first, lock only to push it.
-    let _ = DEQUE.exclusive().enqueue(span);
+    publish_span(span);
     pg_otel_wake_worker();
 }
 
 /// `-1` disables tracing, `0` traces every statement.
 fn meets_slow_query_threshold(duration_ns: i64, min_duration_ms: i32) -> bool {
     min_duration_ms >= 0 && duration_ns >= i64::from(min_duration_ms) * 1_000_000
+}
+
+/// Pushes a finished span onto the shared queue.
+///
+/// Never call Postgres code while holding the DEQUE guard: if that code
+/// raised an ERROR that we catch, the LWLock would leak (pgrx only releases it
+/// on unwind when InterruptHoldoffCount is non-zero), and every later enqueue
+/// would hang. Build the span first, lock only to push it.
+fn publish_span(span: HeaplessSpan) {
+    let Some(span) = capture::divert(span) else {
+        return;
+    };
+    let _ = DEQUE.exclusive().enqueue(span);
 }
 
 pub fn collect_plan_spans(
@@ -160,9 +228,7 @@ pub fn collect_plan_spans(
     if !righttree.is_null() {
         collect_plan_spans(righttree, wall_start, &span);
     }
-    // Same rule as in `collect_spans_unguarded`: no Postgres calls while the
-    // DEQUE guard is held (a caught ERROR would leak the LWLock).
-    let _ = DEQUE.exclusive().enqueue(span);
+    publish_span(span);
 }
 
 pub fn collect_table_names(state: *const pg_sys::PlanState) -> Vec<String> {
@@ -241,18 +307,20 @@ pub fn plan_table_identifier(oid: Oid) -> Option<String> {
     let namespace_name = unsafe { pg_str(pg_sys::get_namespace_name_or_temp(namespace_oid)) };
 
     Some(match namespace_name {
-        Some(namespace_name) => format!("{}.{}", namespace_name, relation_name),
-        None => relation_name.to_owned(),
+        Some(namespace_name) => format!("{namespace_name}.{relation_name}"),
+        None => relation_name.into_owned(),
     })
 }
 
-pub fn pg_str<'a>(s: *const i8) -> Option<&'a str> {
+/// Reads a NUL-terminated string from Postgres, replacing invalid UTF-8 with
+/// U+FFFD. Returns `None` for a null pointer.
+pub fn pg_str<'a>(s: *const i8) -> Option<Cow<'a, str>> {
     if s.is_null() {
         return None;
     }
-    // Check utf-8 validity
+    // SAFETY: non-null; Postgres strings are NUL-terminated and outlive the hook.
     let cstr = unsafe { CStr::from_ptr(s) };
-    cstr.to_str().ok()
+    Some(cstr.to_string_lossy())
 }
 
 /// Wake the worker after work has been added to the shared queue.
@@ -427,6 +495,51 @@ fn percent_decode(text: &str) -> String {
         }
     }
     String::from_utf8_lossy(&decoded).into_owned()
+}
+
+/// Test-only capture of published spans, so tests can inspect exactly what
+/// would be exported without racing the background worker that drains the
+/// shared queue.
+#[cfg(any(test, feature = "pg_test"))]
+pub mod capture {
+    use std::cell::RefCell;
+
+    use crate::span::HeaplessSpan;
+
+    thread_local! {
+        static CAPTURED: RefCell<Option<Vec<HeaplessSpan>>> = const { RefCell::new(None) };
+    }
+
+    /// Starts diverting published spans (instead of queueing them).
+    pub fn start() {
+        CAPTURED.with(|captured| *captured.borrow_mut() = Some(Vec::new()));
+    }
+
+    /// Stops diverting and returns the spans captured since [`start`].
+    pub fn finish() -> Vec<HeaplessSpan> {
+        CAPTURED.with(|captured| captured.borrow_mut().take().unwrap_or_default())
+    }
+
+    /// Returns the span back when nothing is capturing.
+    pub(super) fn divert(span: HeaplessSpan) -> Option<HeaplessSpan> {
+        CAPTURED.with(|captured| match captured.borrow_mut().as_mut() {
+            Some(spans) => {
+                spans.push(span);
+                None
+            }
+            None => Some(span),
+        })
+    }
+}
+
+#[cfg(not(any(test, feature = "pg_test")))]
+mod capture {
+    use crate::span::HeaplessSpan;
+
+    #[inline(always)]
+    pub(super) fn divert(span: HeaplessSpan) -> Option<HeaplessSpan> {
+        Some(span)
+    }
 }
 
 /// Test-only fault injection into the guarded collection path, to prove that
@@ -683,6 +796,81 @@ mod unit_tests {
         assert!(meets_slow_query_threshold(i64::MAX, i32::MAX));
     }
 
+    /// Exact reference for the conversion: `ticks * scale / 2^14`, rounded down.
+    fn reference_ticks_to_ns(ticks: i64, scale: u64) -> i64 {
+        ((i128::from(ticks) * i128::from(scale)) >> TICKS_TO_NS_SHIFT) as i64
+    }
+
+    #[test]
+    fn ticks_are_nanoseconds_when_scale_is_zero() {
+        assert_eq!(ticks_to_ns(123_456, 0, 0), 123_456);
+        assert_eq!(ticks_to_ns(i64::MAX, 0, 0), i64::MAX);
+    }
+
+    #[test]
+    fn converts_tsc_ticks_with_fixed_point_scale() {
+        // 3 GHz TSC: scale = (1e6 << 14) / 3_000_000 kHz = 5461 (1/3 ns per tick).
+        let scale = (1_000_000_u64 << TICKS_TO_NS_SHIFT) / 3_000_000;
+        let max = (i64::MAX as u64) / scale;
+        assert_eq!(scale, 5461);
+        assert_eq!(ticks_to_ns(0, scale, max), 0);
+        assert_eq!(ticks_to_ns(16_384, scale, max), 5_461);
+        // One second of ticks is one second up to the fixed-point rounding error.
+        let one_second = ticks_to_ns(3_000_000_000, scale, max);
+        assert!(
+            (999_000_000..=1_000_000_000).contains(&one_second),
+            "{one_second}"
+        );
+    }
+
+    #[test]
+    fn matches_exact_arithmetic_including_the_overflow_branch() {
+        for &(scale, max_ticks) in &[
+            (5461_u64, i64::MAX as u64 / 5461),
+            (16_384, i64::MAX as u64 / 16_384),
+            (1, i64::MAX as u64),
+        ] {
+            let mut samples = vec![
+                0,
+                1,
+                16_383,
+                16_384,
+                16_385,
+                max_ticks as i64 - 1,
+                max_ticks as i64,
+                (max_ticks as i64).saturating_add(1),
+                i64::MAX / 2,
+            ];
+            let mut rng = fastrand::Rng::with_seed(7);
+            samples.extend((0..2_000).map(|_| rng.i64(0..=max_ticks as i64)));
+            samples.extend((0..2_000).map(|_| rng.i64(0..=i64::MAX)));
+            for ticks in samples {
+                let expected = reference_ticks_to_ns(ticks, scale);
+                assert_eq!(
+                    ticks_to_ns(ticks, scale, max_ticks),
+                    expected,
+                    "ticks={ticks} scale={scale}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn conversion_saturates_instead_of_overflowing() {
+        // Inconsistent inputs (max too large for the scale) must not panic.
+        assert!(ticks_to_ns(i64::MAX, 1 << 40, u64::MAX) > 0);
+        assert!(ticks_to_ns(i64::MAX, u64::MAX, 0) > 0);
+    }
+
+    #[test]
+    fn explain_only_flag_is_detected() {
+        assert!(is_explain_only(pg_sys::EXEC_FLAG_EXPLAIN_ONLY as i32));
+        assert!(is_explain_only(
+            pg_sys::EXEC_FLAG_EXPLAIN_ONLY as i32 | 0x10
+        ));
+        assert!(!is_explain_only(0));
+    }
+
     #[test]
     fn tracing_disabled_when_off_or_in_parallel_worker() {
         assert!(!tracing_enabled(-1, -1));
@@ -698,12 +886,156 @@ mod unit_tests {
 #[cfg(any(test, feature = "pg_test"))]
 #[pgrx::pg_schema]
 mod tests {
+    use opentelemetry::Value;
+    use opentelemetry_sdk::trace::SpanData;
     use pgrx::prelude::*;
 
-    use super::fault::{self, Fault};
+    use super::{
+        capture,
+        fault::{self, Fault},
+    };
 
     const TP: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
     const TP_UNSAMPLED: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00";
+
+    /// Runs `sql` with tracing of every statement enabled and returns the spans
+    /// that would have been exported for it.
+    fn traced_spans(sql: &str) -> Vec<SpanData> {
+        Spi::run("SET pg_otel.min_duration_ms = 0").unwrap();
+        capture::start();
+        let result = Spi::run(sql);
+        let spans = capture::finish();
+        result.unwrap();
+        spans.into_iter().map(SpanData::from).collect()
+    }
+
+    fn attr<'a>(span: &'a SpanData, key: &str) -> Option<&'a Value> {
+        span.attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == key)
+            .map(|kv| &kv.value)
+    }
+
+    fn number(span: &SpanData, key: &str) -> f64 {
+        match attr(span, key) {
+            Some(Value::F64(value)) => *value,
+            Some(Value::I64(value)) => *value as f64,
+            other => panic!("{key} is not a number: {other:?}"),
+        }
+    }
+
+    fn query_span(spans: &[SpanData]) -> &SpanData {
+        let mut roots = spans.iter().filter(|s| attr(s, "db.operation").is_some());
+        let root = roots.next().expect("a query span");
+        assert!(roots.next().is_none(), "exactly one query span expected");
+        root
+    }
+
+    fn query_text(span: &SpanData) -> Option<String> {
+        attr(span, "db.query.text").map(|v| v.as_str().into_owned())
+    }
+
+    #[pg_test]
+    fn normalized_query_text_hides_literals() {
+        let spans = traced_spans("SELECT 'secret_value_xyz'::text");
+        let text = query_text(query_span(&spans)).expect("query text");
+        assert!(!text.contains("secret_value_xyz"), "{text}");
+        assert!(text.contains("$1"), "{text}");
+    }
+
+    #[pg_test]
+    fn raw_query_text_is_exported_as_is() {
+        Spi::run("SET pg_otel.query_text = 'raw'").unwrap();
+        let spans = traced_spans("SELECT 'secret_value_xyz'::text");
+        let text = query_text(query_span(&spans)).expect("query text");
+        assert!(text.contains("secret_value_xyz"), "{text}");
+    }
+
+    #[pg_test]
+    fn off_query_text_exports_no_text() {
+        Spi::run("SET pg_otel.query_text = 'off'").unwrap();
+        let spans = traced_spans("SELECT 'secret_value_xyz'::text");
+        assert!(attr(query_span(&spans), "db.query.text").is_none());
+        for span in &spans {
+            assert!(!format!("{:?}", span.attributes).contains("secret_value_xyz"));
+        }
+    }
+
+    #[pg_test]
+    fn query_text_is_limited_to_the_queue_capacity() {
+        Spi::run("SET pg_otel.query_text = 'raw'").unwrap();
+        let long = "x".repeat(2_000);
+        let spans = traced_spans(&format!("SELECT '{long}'"));
+        let text = query_text(query_span(&spans)).expect("query text");
+        assert!(
+            text.len() <= crate::span::QUERY_TEXT_MAX_LEN,
+            "{}",
+            text.len()
+        );
+    }
+
+    #[pg_test]
+    fn query_id_is_exported_when_computed() {
+        Spi::run("SET compute_query_id = on").unwrap();
+        let spans = traced_spans("SELECT 1");
+        assert_ne!(number(query_span(&spans), "db.query.id"), 0.0);
+
+        Spi::run("SET compute_query_id = off").unwrap();
+        let spans = traced_spans("SELECT 1");
+        assert!(attr(query_span(&spans), "db.query.id").is_none());
+    }
+
+    #[pg_test]
+    fn duration_is_in_plausible_microseconds() {
+        let started = std::time::Instant::now();
+        let spans = traced_spans("SELECT pg_sleep(0.05)");
+        let measured_us = started.elapsed().as_micros() as f64;
+        let span = query_span(&spans);
+        let micros = number(span, "span.duration.us");
+        assert!((40_000.0..5_000_000.0).contains(&micros), "{micros}us");
+        // Raw TSC ticks mistaken for nanoseconds would exceed the real wall
+        // time measured independently here. The slack absorbs TSC calibration
+        // error and scheduling noise; a ticks-vs-ns mixup still fails by far.
+        assert!(
+            micros <= measured_us * 1.05 + 1_000.0,
+            "{micros}us > measured {measured_us}us"
+        );
+        let seconds = number(span, "postgresql.execution.total_time_seconds");
+        assert!((micros / 1e6 - seconds).abs() < 1e-9);
+        let wall = span.end_time.duration_since(span.start_time).unwrap();
+        assert_eq!(wall.as_micros() as f64, micros.floor());
+    }
+
+    #[pg_test]
+    fn plan_node_reports_rows_and_loops() {
+        Spi::run("CREATE TEMP TABLE otel_rows AS SELECT generate_series(1, 10) AS i").unwrap();
+        let spans = traced_spans("SELECT * FROM otel_rows");
+        let query = query_span(&spans);
+        let scan = spans
+            .iter()
+            .find(|s| {
+                attr(s, "postgresql.plan.node_type").is_some_and(|v| v.as_str() == "T_SeqScanState")
+            })
+            .expect("a seq scan span");
+        assert_eq!(number(scan, "postgresql.instrumentation.rows"), 10.0);
+        assert_eq!(number(scan, "postgresql.instrumentation.loops"), 1.0);
+        assert!(number(scan, "span.duration.us") >= 0.0);
+        assert_eq!(scan.parent_span_id, query.span_context.span_id());
+        assert_eq!(scan.start_time, query.start_time);
+        assert!(scan.end_time <= query.end_time);
+    }
+
+    #[pg_test]
+    fn explain_without_analyze_emits_nothing() {
+        let spans = traced_spans("EXPLAIN SELECT 1");
+        assert!(spans.is_empty(), "{} unexpected spans", spans.len());
+    }
+
+    #[pg_test]
+    fn explain_analyze_still_emits_spans() {
+        let spans = traced_spans("EXPLAIN (ANALYZE) SELECT 1");
+        assert!(!spans.is_empty());
+    }
 
     fn query_value(sql: &str) -> Option<i32> {
         Spi::get_one::<i32>(sql).expect("query must not fail")

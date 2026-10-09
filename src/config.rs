@@ -228,7 +228,6 @@ fn define_query_text_guc() {
 }
 
 /// Returns the configured [`QueryTextMode`].
-#[allow(dead_code)] // wired in later phase
 pub fn get_query_text_mode() -> QueryTextMode {
     QUERY_TEXT.get()
 }

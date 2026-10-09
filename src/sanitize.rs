@@ -56,9 +56,6 @@
 //! collide. A space is inserted where a placeholder would otherwise fuse with a
 //! neighbouring word (`N'x'` becomes `N $1`, not `N$1`).
 
-// Wired into span export in a later phase.
-#![allow(dead_code)]
-
 use std::{
     ffi::{CStr, CString, c_char, c_int},
     fmt::Write as _,
