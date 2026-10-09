@@ -46,7 +46,7 @@ pg_otel.otlp_ca_certificate = '' # path to a CA certificate file if you have a c
 | `pg_otel.otlp_ca_certificate` | string | unset | config file / reload | Path to a custom CA certificate. |
 | `otel.service.name` | string | `postgresql` | config file / reload | `service.name` resource attribute. |
 | `pg_otel.traceparent` | string | unset | any user, per session/transaction | W3C `traceparent` of the parent span. See [Usage](#usage). |
-| `pg_otel.query_text` | enum | `normalized` | **superuser only** | `off`: no query text. `normalized`: literals are replaced with placeholders. `raw`: the query text as received (may contain sensitive data). |
+| `pg_otel.query_text` | enum | `normalized` | **superuser only** | `off`: no query text. `normalized`: literals are replaced with placeholders (quoted identifiers such as `"My Table"` are kept as is). `raw`: the query text as received (may contain sensitive data). |
 | `pg_otel.min_duration_ms` | int (ms) | `-1` | **superuser only** | Only export spans for statements that run at least this long. `-1` disables tracing, `0` traces every statement. Restricted to superusers so that regular users cannot force tracing of everything. |
 | `pg_otel.queue_size_kb` | int (kB) | `1024` | server start only | Size of the shared-memory span queue (64 to 1048576). Needs a restart because shared memory is allocated at startup. |
 

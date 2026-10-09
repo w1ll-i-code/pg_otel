@@ -16,6 +16,7 @@ use crate::{
 
 mod config;
 mod postgres;
+mod sanitize;
 mod span;
 mod worker;
 
@@ -112,5 +113,20 @@ unsafe extern "C-unwind" fn my_executor_end_hook(query_desc: *mut pg_sys::QueryD
         } else {
             pg_sys::standard_ExecutorEnd(query_desc);
         }
+    }
+}
+
+/// This module is required by `cargo pgrx test` invocations.
+/// It must be visible at the root of your extension crate.
+#[cfg(any(test, feature = "pg_test"))]
+pub mod pg_test {
+    pub fn setup(_options: Vec<&str>) {
+        // perform one-off initialization when the pg_test framework starts
+    }
+
+    #[must_use]
+    pub fn postgresql_conf_options() -> Vec<&'static str> {
+        // `_PG_init` refuses to run unless the library is preloaded.
+        vec!["shared_preload_libraries = 'pg_otel'"]
     }
 }
