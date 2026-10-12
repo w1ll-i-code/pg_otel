@@ -54,8 +54,9 @@
 //! `x = -5` becomes `x = -$1`. Existing `$n` parameters are kept and
 //! new placeholders are numbered above the highest existing one so they never
 //! collide. A space is inserted where a placeholder would otherwise fuse with a
-//! neighbouring word (`N'x'` becomes `N $1`, not `N$1`).
-
+//! neighbouring word (`N'x'` becomes `N $1`, not `N$1`). Comma-delimited
+//! `SELECT` lists retain their first item and become
+//! `SELECT first, ...(N more columns)`; subsequent clauses are retained.
 use std::{
     ffi::{CStr, CString, c_char, c_int},
     fmt::Write as _,
@@ -114,6 +115,16 @@ struct Token {
     end: usize,
 }
 
+/// A comma-delimited portion of a `SELECT` list to replace during rendering.
+/// `start` is the first comma after the retained column and `end` is the first
+/// token after the select list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectListCompaction {
+    start: usize,
+    end: usize,
+    additional_columns: usize,
+}
+
 /// Extracts the statement at `stmt_location`/`stmt_len` from `source_text`.
 ///
 /// `stmt_location` and `stmt_len` follow the `PlannedStmt` conventions: a
@@ -167,7 +178,8 @@ fn validated_range(total: usize, stmt_location: i32, stmt_len: i32) -> Option<(i
     Some((stmt_location, len))
 }
 
-/// Replaces literal constants in `sql` with `$1`, `$2`, ... and drops comments.
+/// Replaces literal constants in `sql` with `$1`, `$2`, ..., compacts `SELECT`
+/// column lists, and drops comments.
 ///
 /// See the [module documentation](self) for the exact output rules. The
 /// function never raises a Postgres error and emits no notices: input that the
@@ -332,11 +344,41 @@ fn render(sql: &str, tokens: &[Token]) -> Option<String> {
         })
         .max()
         .map_or(1, |highest| highest.saturating_add(1));
+    let compactions = select_list_compactions(sql, tokens)?;
 
     let mut out = String::with_capacity(sql.len());
     let mut previous_end: Option<usize> = None;
     let mut placeholder = String::new();
-    for token in tokens {
+    let mut token_index = 0;
+    let mut compaction_index = 0;
+
+    while token_index < tokens.len() {
+        if let Some(compaction) = compactions.get(compaction_index)
+            && token_index == compaction.start
+        {
+            let skipped = &tokens[compaction.start..compaction.end];
+            let mut last_end = previous_end;
+            for token in skipped {
+                if matches!(token.kind, TokenKind::Constant) {
+                    next_placeholder = next_placeholder.saturating_add(1);
+                }
+                let _ = sql.get(token.start..token.end)?;
+                if let Some(end) = last_end
+                    && token.start < end
+                {
+                    return None;
+                }
+                last_end = Some(token.end);
+            }
+            // Writing to a String cannot fail.
+            let _ = write!(out, ", ...({} more columns)", compaction.additional_columns);
+            previous_end = last_end;
+            token_index = compaction.end;
+            compaction_index += 1;
+            continue;
+        }
+
+        let token = tokens.get(token_index)?;
         let text = match token.kind {
             TokenKind::Constant => {
                 placeholder.clear();
@@ -357,8 +399,100 @@ fn render(sql: &str, tokens: &[Token]) -> Option<String> {
         }
         out.push_str(text);
         previous_end = Some(token.end);
+        token_index += 1;
     }
     Some(out)
+}
+
+/// Finds comma-delimited `SELECT` lists that can be compacted without losing
+/// the clauses that follow them. This is intentionally lexical: scanner tokens
+/// let us count commas only at the `SELECT`'s parenthesis depth, while malformed
+/// SQL continues to be handled by the scanner/render validation path.
+fn select_list_compactions(sql: &str, tokens: &[Token]) -> Option<Vec<SelectListCompaction>> {
+    let mut depths = Vec::with_capacity(tokens.len());
+    let mut depth = 0_i32;
+    for token in tokens {
+        let text = sql.get(token.start..token.end)?;
+        depths.push(depth);
+        match text {
+            "(" => depth += 1,
+            ")" => depth -= 1,
+            _ => {}
+        }
+    }
+
+    let mut compactions = Vec::new();
+    for (select_index, token) in tokens.iter().enumerate() {
+        if !sql
+            .get(token.start..token.end)?
+            .eq_ignore_ascii_case("SELECT")
+        {
+            continue;
+        }
+
+        let select_depth = depths[select_index];
+        let mut first_comma = None;
+        let mut additional_columns = 0;
+        let mut end = tokens.len();
+        for index in select_index + 1..tokens.len() {
+            let text = sql.get(tokens[index].start..tokens[index].end)?;
+            if depths[index] != select_depth {
+                continue;
+            }
+            if text == ")" || text == ";" || select_list_terminator(text) {
+                end = index;
+                break;
+            }
+            if text == "," {
+                if first_comma.is_none() {
+                    first_comma = Some(index);
+                }
+                additional_columns += 1;
+            }
+        }
+        if let Some(start) = first_comma {
+            compactions.push(SelectListCompaction {
+                start,
+                end,
+                additional_columns,
+            });
+        }
+    }
+
+    compactions.sort_unstable_by_key(|compaction| compaction.start);
+    // An outer list can contain a nested SELECT after its first column. Its
+    // compaction subsumes the nested one, so retain only non-overlapping ranges.
+    let mut non_overlapping = Vec::with_capacity(compactions.len());
+    for compaction in compactions {
+        if non_overlapping
+            .last()
+            .is_none_or(|previous: &SelectListCompaction| previous.end <= compaction.start)
+        {
+            non_overlapping.push(compaction);
+        }
+    }
+    Some(non_overlapping)
+}
+
+fn select_list_terminator(token: &str) -> bool {
+    [
+        "EXCEPT",
+        "FETCH",
+        "FOR",
+        "FROM",
+        "GROUP",
+        "HAVING",
+        "INTO",
+        "INTERSECT",
+        "LIMIT",
+        "OFFSET",
+        "ORDER",
+        "UNION",
+        "WHERE",
+        "WINDOW",
+    ]
+    .iter()
+    .any(|keyword| token.eq_ignore_ascii_case(keyword))
 }
 
 /// Whether appending `next` to `out` without a separator would merge two
@@ -512,6 +646,29 @@ mod pure_tests {
     }
 
     #[test]
+    fn render_compacts_select_lists_and_keeps_placeholder_numbers() {
+        let sql = "SELECT a, 'secret', c FROM t WHERE x = 42";
+        let tokens = [
+            token(TokenKind::Other, 0, 6),
+            token(TokenKind::Other, 7, 8),
+            token(TokenKind::Other, 8, 9),
+            token(TokenKind::Constant, 10, 18),
+            token(TokenKind::Other, 18, 19),
+            token(TokenKind::Other, 20, 21),
+            token(TokenKind::Other, 22, 26),
+            token(TokenKind::Other, 27, 28),
+            token(TokenKind::Other, 29, 34),
+            token(TokenKind::Other, 35, 36),
+            token(TokenKind::Other, 37, 38),
+            token(TokenKind::Constant, 39, 41),
+        ];
+        assert_eq!(
+            render(sql, &tokens).as_deref(),
+            Some("SELECT a, ...(2 more columns) FROM t WHERE x = $2")
+        );
+    }
+
+    #[test]
     fn render_of_no_tokens_is_empty() {
         assert_eq!(render("  -- c", &[]).as_deref(), Some(""));
     }
@@ -547,32 +704,32 @@ mod tests {
     #[pg_test]
     fn masks_escape_strings() {
         let out = norm(r"SELECT E'sec\'ret\n', e'other'");
-        assert_eq!(out, "SELECT $1, $2");
+        assert_eq!(out, "SELECT $1, ...(1 more columns)");
         assert!(!out.contains("sec"));
     }
 
     #[pg_test]
     fn masks_unicode_escape_strings() {
         let out = norm(r"SELECT U&'d\0061ta secret', U&'!0061' UESCAPE '!'");
-        assert_eq!(out, "SELECT $1, $2 UESCAPE $3");
+        assert_eq!(out, "SELECT $1, ...(1 more columns)");
     }
 
     #[pg_test]
     fn masks_dollar_quoted_strings() {
         let out = norm("SELECT $$sec'ret$$, $tag$ in$$ner 'x' $tag$ FROM t");
-        assert_eq!(out, "SELECT $1, $2 FROM t");
+        assert_eq!(out, "SELECT $1, ...(1 more columns) FROM t");
     }
 
     #[pg_test]
     fn masks_bit_and_hex_strings() {
         let out = norm("SELECT B'101010', b'1', X'DEADBEEF', x'ff'");
-        assert_eq!(out, "SELECT $1, $2, $3, $4");
+        assert_eq!(out, "SELECT $1, ...(3 more columns)");
     }
 
     #[pg_test]
     fn masks_numbers() {
         let out = norm("SELECT 42, 3.14159, 1e10, .5, 0x1F, 1_000, 99999999999999999999");
-        assert_eq!(out, "SELECT $1, $2, $3, $4, $5, $6, $7");
+        assert_eq!(out, "SELECT $1, ...(6 more columns)");
     }
 
     #[pg_test]
@@ -585,7 +742,7 @@ mod tests {
     #[pg_test]
     fn typed_literals_are_masked() {
         let out = norm("SELECT DATE '2020-01-02', INTERVAL '1 day', 'x'::text");
-        assert_eq!(out, "SELECT DATE $1, INTERVAL $2, $3::text");
+        assert_eq!(out, "SELECT DATE $1, ...(2 more columns)");
     }
 
     #[pg_test]
@@ -609,7 +766,7 @@ mod tests {
     #[pg_test]
     fn comment_markers_inside_literals_are_masked_not_stripped() {
         let out = norm("SELECT '-- not a comment', '/* nor this */' FROM t");
-        assert_eq!(out, "SELECT $1, $2 FROM t");
+        assert_eq!(out, "SELECT $1, ...(1 more columns) FROM t");
     }
 
     #[pg_test]
@@ -626,10 +783,11 @@ mod tests {
 
     #[pg_test]
     fn operators_and_identifiers_survive() {
-        let out = norm(r#"SELECT "Quoted Ident", a->>'k', a::int, b<=c FROM s.t"#);
+        let out =
+            norm(r#"SELECT "Quoted Ident", a->>'k', a::int, b<=c FROM s.t WHERE d->>'v' = 'x'"#);
         assert_eq!(
             out,
-            r#"SELECT "Quoted Ident", a->>$1, a::int, b<=c FROM s.t"#
+            r#"SELECT "Quoted Ident", ...(3 more columns) FROM s.t WHERE d->>$2 = $3"#
         );
     }
 
@@ -713,7 +871,10 @@ mod tests {
                 sanitize(source.as_ptr(), start, len, true, 8),
             )
         };
-        assert_eq!(normalized.as_deref(), Some("SELECT $1, $2 FROM t"));
+        assert_eq!(
+            normalized.as_deref(),
+            Some("SELECT $1, ...(1 more columns) FROM t")
+        );
         assert_eq!(raw.as_deref(), Some("SELECT 'topsecret', 22 FROM t"));
         assert_eq!(short.as_deref(), Some("SELECT $"));
     }
@@ -749,7 +910,7 @@ mod tests {
     #[pg_test]
     fn national_literal_does_not_fuse_with_placeholder() {
         let out = norm("SELECT N'secret', n'secret2' FROM t");
-        assert_eq!(out, "SELECT N $1, n $2 FROM t");
+        assert_eq!(out, "SELECT N $1, ...(1 more columns) FROM t");
     }
 
     #[pg_test]
